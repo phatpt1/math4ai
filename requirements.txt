@@ -1,6 +1,3 @@
 streamlit
-pandas
-lightgbm
-joblib
-scikit-learn
-plotly
+numpy
+matplotlib
