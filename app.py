@@ -41,6 +41,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
@@ -858,6 +859,217 @@ def push_bundle_to_github(bundle):
     }
 
 
+
+# ============================================================
+# 5B. LOAD SAVED MODEL ON APP START
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def load_saved_bundle():
+    """
+    Ưu tiên:
+    1) Load model đã commit trong repo local:
+       models/purchase_model_bundle.joblib
+    2) Nếu file local chưa có, thử tải trực tiếp từ GitHub Contents API.
+
+    Nhờ vậy:
+    - Không cần train lại mỗi lần Streamlit restart.
+    - Train chỉ dùng khi muốn cập nhật model.
+    """
+    # 1. Local repo file
+    if os.path.exists(MODEL_PATH_IN_REPO):
+        try:
+            return joblib.load(MODEL_PATH_IN_REPO)
+        except Exception as e:
+            st.warning(
+                f"Tìm thấy model local nhưng load thất bại: {e}"
+            )
+
+    # 2. GitHub fallback
+    try:
+        if "GITHUB_TOKEN" not in st.secrets:
+            return None
+
+        config = get_github_config()
+
+        response = requests.get(
+            github_contents_url(
+                config["repo"],
+                MODEL_PATH_IN_REPO,
+            ),
+            headers=github_headers(
+                config["token"]
+            ),
+            params={
+                "ref": config["branch"]
+            },
+            timeout=60,
+        )
+
+        if response.status_code == 404:
+            return None
+
+        if not response.ok:
+            st.warning(
+                "Không tải được model từ GitHub: "
+                f"{response.status_code}"
+            )
+            return None
+
+        payload = response.json()
+
+        # GitHub Contents API trả binary dưới dạng base64
+        encoded = payload.get("content")
+        if not encoded:
+            return None
+
+        model_bytes = base64.b64decode(
+            encoded
+        )
+
+        return joblib.load(
+            BytesIO(model_bytes)
+        )
+
+    except Exception as e:
+        st.warning(
+            f"Không thể load model đã lưu từ GitHub: {e}"
+        )
+        return None
+
+
+
+# ============================================================
+# 5C. VISUAL PURCHASE DEMO
+# ============================================================
+
+def render_purchase_demo(score, threshold, pred, model_name, input_df, bundle):
+    """
+    Demo trực quan nhưng KHÔNG bịa reasoning.
+    - Gauge hiển thị model score.
+    - Threshold lấy từ validation.
+    - Marketing suggestion chỉ là rule demo,
+      tách biệt khỏi reasoning của model.
+    - Với LightGBM, top local contributions lấy trực tiếp từ model.
+    """
+    st.markdown("### 🎯 Demo trực quan khả năng mua hàng")
+
+    score_pct = float(score * 100.0)
+    threshold_pct = float(threshold * 100.0)
+
+    # Gauge
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number+delta",
+            value=score_pct,
+            number={"suffix": "%", "valueformat": ".1f"},
+            delta={
+                "reference": threshold_pct,
+                "valueformat": ".1f",
+                "suffix": " điểm",
+            },
+            title={
+                "text": (
+                    f"Điểm xu hướng mua — {model_name}<br>"
+                    f"<span style='font-size:0.8em'>"
+                    f"Ngưỡng quyết định: {threshold_pct:.1f}%"
+                    f"</span>"
+                )
+            },
+            gauge={
+                "axis": {"range": [0, 100]},
+                "bar": {"thickness": 0.32},
+                "steps": [
+                    {"range": [0, threshold_pct], "color": "#f8d7da"},
+                    {"range": [threshold_pct, min(100, threshold_pct + 20)], "color": "#fff3cd"},
+                    {"range": [min(100, threshold_pct + 20), 100], "color": "#d1e7dd"},
+                ],
+                "threshold": {
+                    "line": {"color": "black", "width": 4},
+                    "thickness": 0.8,
+                    "value": threshold_pct,
+                },
+            },
+        )
+    )
+    fig.update_layout(height=360, margin=dict(l=20, r=20, t=80, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Decision card
+    if pred == 1:
+        st.success(
+            f"### ✅ Dự đoán: CÓ KHẢ NĂNG MUA\n"
+            f"Model score = **{score_pct:.2f}%** ≥ threshold = **{threshold_pct:.2f}%**"
+        )
+    else:
+        st.error(
+            f"### ❌ Dự đoán: KHÔNG MUA\n"
+            f"Model score = **{score_pct:.2f}%** < threshold = **{threshold_pct:.2f}%**"
+        )
+
+    # Score bands — explicitly business demo, not model explanation
+    st.markdown("#### 💼 Gợi ý hành động demo")
+    high_cut = min(0.90, threshold + 0.20)
+    medium_cut = threshold
+
+    if score >= high_cut:
+        st.success(
+            "🟢 **Nhóm ưu tiên cao** — khách đã có tín hiệu mua mạnh. "
+            "Có thể ưu tiên trải nghiệm checkout, tránh khuyến mãi quá mức."
+        )
+    elif score >= medium_cut:
+        st.warning(
+            "🟠 **Nhóm cân nhắc** — model đã xếp vào lớp Mua nhưng chưa cách xa threshold. "
+            "Có thể thử ưu đãi nhẹ hoặc nhắc hoàn tất đơn."
+        )
+    else:
+        st.info(
+            "🔵 **Nhóm ưu tiên thấp** — chưa vượt threshold. "
+            "Có thể dùng nội dung nuôi dưỡng thay vì chi ngân sách remarketing mạnh."
+        )
+
+    st.caption(
+        "Các gợi ý marketing ở trên là **rule demo của ứng dụng**, "
+        "không phải lời giải thích nội bộ của mô hình."
+    )
+
+    # Immediate real explanation for LightGBM
+    if "LightGBM" in bundle["models"]:
+        st.markdown("#### 🧠 5 yếu tố tác động mạnh nhất cho chính khách này")
+        try:
+            base, raw_score, contrib = get_lgbm_contributions(input_df, bundle)
+            top5 = contrib.head(5).copy()
+            top5["direction"] = np.where(
+                top5["contribution"] >= 0,
+                "Đẩy về Mua",
+                "Đẩy về Không mua",
+            )
+            top5 = top5.sort_values("contribution")
+
+            fig2 = px.bar(
+                top5,
+                x="contribution",
+                y="feature",
+                orientation="h",
+                color="direction",
+                text="contribution",
+                title="Local contribution — lấy trực tiếp từ LightGBM",
+            )
+            fig2.update_traces(texttemplate="%{text:.3f}")
+            st.plotly_chart(fig2, use_container_width=True)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Base raw score", f"{base:.3f}")
+            c2.metric("Final raw score", f"{raw_score:.3f}")
+            c3.metric("Sigmoid(raw)", f"{sigmoid(raw_score)*100:.1f}%")
+        except Exception as e:
+            st.caption(f"Không render được local contribution: {e}")
+
+    # Input summary
+    with st.expander("🔎 Xem dữ liệu khách hàng vừa nhập"):
+        st.dataframe(input_df, use_container_width=True, hide_index=True)
+
+
 # ============================================================
 # 6. SESSION STATE
 # ============================================================
@@ -869,7 +1081,9 @@ if "dataset_name" not in st.session_state:
     st.session_state["dataset_name"] = None
 
 if "bundle" not in st.session_state:
-    st.session_state["bundle"] = None
+    # QUAN TRỌNG:
+    # Khi app khởi động, tự load model đã train trước đó.
+    st.session_state["bundle"] = load_saved_bundle()
 
 
 # ============================================================
@@ -882,9 +1096,15 @@ st.title(
 
 st.caption(
     "Một app.py duy nhất: "
-    "Upload → Train → Evaluate → Predict → Explain → "
-    "Commit model lên GitHub."
+    "Load model đã lưu → Predict ngay; "
+    "chỉ Re-train khi muốn cập nhật model."
 )
+
+if st.session_state.get("bundle") is not None:
+    st.success(
+        "✅ Model đã được load tự động từ repo/GitHub. "
+        "Bạn có thể Predict ngay mà không cần train lại."
+    )
 
 
 # ============================================================
@@ -893,6 +1113,21 @@ st.caption(
 
 with st.sidebar:
     st.header("⚙️ Pipeline")
+
+    if st.session_state["bundle"] is not None:
+        st.success(
+            "✅ Đã load model đã train. "
+            "Không cần train lại để Predict."
+        )
+        st.caption(
+            "Chỉ bấm Train khi bạn thay dataset, "
+            "hyperparameter hoặc muốn cập nhật model."
+        )
+    else:
+        st.warning(
+            "⚠️ Chưa có model đã lưu. "
+            "Lần đầu cần Train + cập nhật GitHub."
+        )
 
     uploaded = st.file_uploader(
         "Upload online_shoppers.csv",
@@ -960,12 +1195,12 @@ with st.sidebar:
         )
 
         train_only = st.button(
-            "🧠 Train chỉ trong Streamlit",
+            "🧠 Re-train chỉ trong Streamlit",
             use_container_width=True,
         )
 
         train_and_push = st.button(
-            "🚀 Train + cập nhật GitHub",
+            "🚀 Re-train + cập nhật GitHub",
             type="primary",
             use_container_width=True,
         )
@@ -1766,6 +2001,15 @@ with tabs[3]:
             st.warning(
                 "Model score chưa mặc nhiên "
                 "là calibrated probability."
+            )
+
+            render_purchase_demo(
+                score=score,
+                threshold=threshold,
+                pred=pred,
+                model_name=model_name,
+                input_df=input_df,
+                bundle=bundle,
             )
 
 
