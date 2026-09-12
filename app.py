@@ -1,765 +1,2086 @@
-# Giới hạn thread trước khi import ML libraries.
-# Đây là biện pháp deployment để tránh oversubscription trên một số máy chủ,
-# KHÔNG phải yêu cầu toán học của LightGBM.
+# ============================================================
+# ONLINE SHOPPER PURCHASE PREDICTION — ONE FILE ONLY
+# Streamlit + Training + Evaluation + Prediction + Explainability
+# + Auto update trained model/metrics to GitHub
+# ============================================================
+#
+# Streamlit Secrets cần có:
+#
+# GITHUB_TOKEN = "YOUR_TOKEN"
+#
+# Có thể thêm:
+# GITHUB_REPO = "phatpt1/math4ai"
+# GITHUB_BRANCH = "main"
+#
+# KHÔNG hard-code token vào source code.
+#
+# requirements.txt tối thiểu:
+# streamlit
+# pandas
+# numpy
+# scikit-learn
+# lightgbm
+# plotly
+# joblib
+# requests
+# ============================================================
+
 import os
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-from pathlib import Path
+import base64
+import json
 import math
+from datetime import datetime, timezone
+from io import BytesIO
 
 import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
+import requests
 import streamlit as st
 
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import BaggingClassifier, RandomForestClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.tree import DecisionTreeClassifier
+
+
+# ============================================================
+# 0. APP CONFIG
+# ============================================================
 
 st.set_page_config(
-    page_title="Online Shopper Purchase Prediction",
+    page_title="Online Shopper ML Lab",
     page_icon="🛒",
     layout="wide",
 )
 
-BUNDLE_FILE = "purchase_model_bundle.joblib"
+RANDOM_STATE = 42
+TARGET = "Revenue"
+
+DEFAULT_GITHUB_REPO = "phatpt1/math4ai"
+DEFAULT_GITHUB_BRANCH = "main"
+
+MODEL_PATH_IN_REPO = "models/purchase_model_bundle.joblib"
+METRICS_PATH_IN_REPO = "artifacts/latest_metrics.json"
+
+EXPECTED_COLUMNS = [
+    "Administrative",
+    "Administrative_Duration",
+    "Informational",
+    "Informational_Duration",
+    "ProductRelated",
+    "ProductRelated_Duration",
+    "BounceRates",
+    "ExitRates",
+    "PageValues",
+    "SpecialDay",
+    "Month",
+    "OperatingSystems",
+    "Browser",
+    "Region",
+    "TrafficType",
+    "VisitorType",
+    "Weekend",
+    "Revenue",
+]
+
+CATEGORICAL_FEATURES = [
+    "Month",
+    "OperatingSystems",
+    "Browser",
+    "Region",
+    "TrafficType",
+    "VisitorType",
+    "Weekend",
+]
+
+NUMERIC_FEATURES = [
+    "Administrative",
+    "Administrative_Duration",
+    "Informational",
+    "Informational_Duration",
+    "ProductRelated",
+    "ProductRelated_Duration",
+    "BounceRates",
+    "ExitRates",
+    "PageValues",
+    "SpecialDay",
+]
 
 
-@st.cache_resource
-def load_bundle():
-    return joblib.load(BUNDLE_FILE)
+# ============================================================
+# 1. DATA HELPERS
+# ============================================================
+
+def make_one_hot_encoder():
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=True)
+
+
+def make_bagging(base_tree):
+    try:
+        return BaggingClassifier(
+            estimator=base_tree,
+            n_estimators=120,
+            bootstrap=True,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        )
+    except TypeError:
+        return BaggingClassifier(
+            base_estimator=base_tree,
+            n_estimators=120,
+            bootstrap=True,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        )
+
+
+def validate_dataset(df: pd.DataFrame):
+    missing = [c for c in EXPECTED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "Dataset thiếu các cột bắt buộc: " + ", ".join(missing)
+        )
+
+
+def normalize_dataset(df: pd.DataFrame):
+    df = df.copy()
+    validate_dataset(df)
+
+    # Chuẩn hóa target về 0/1
+    if df[TARGET].dtype == bool:
+        df[TARGET] = df[TARGET].astype(int)
+    else:
+        mapping = {
+            True: 1,
+            False: 0,
+            "True": 1,
+            "False": 0,
+            "TRUE": 1,
+            "FALSE": 0,
+            "1": 1,
+            "0": 0,
+            1: 1,
+            0: 0,
+        }
+
+        converted = df[TARGET].map(mapping)
+
+        if converted.isna().any():
+            try:
+                converted = df[TARGET].astype(int)
+            except Exception as e:
+                raise ValueError(
+                    "Cột Revenue phải là True/False hoặc 1/0."
+                ) from e
+
+        df[TARGET] = converted.astype(int)
+
+    if not set(df[TARGET].unique()).issubset({0, 1}):
+        raise ValueError("Revenue phải chỉ gồm 0/1.")
+
+    # Giữ đúng category dtype. Không stringify category số/bool.
+    category_levels = {}
+
+    for col in CATEGORICAL_FEATURES:
+        if df[col].isna().any():
+            df[col] = (
+                df[col]
+                .astype("object")
+                .where(df[col].notna(), "Missing")
+            )
+
+        df[col] = df[col].astype("category")
+        category_levels[col] = list(df[col].cat.categories)
+
+    return df, category_levels
+
+
+def split_data(df):
+    X = df.drop(columns=[TARGET])
+    y = df[TARGET]
+
+    # 70 / 15 / 15
+    X_train_val, X_test, y_train_val, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.15,
+        random_state=RANDOM_STATE,
+        stratify=y,
+    )
+
+    val_fraction = 0.15 / 0.85
+
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_val,
+        y_train_val,
+        test_size=val_fraction,
+        random_state=RANDOM_STATE,
+        stratify=y_train_val,
+    )
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+
+def build_preprocessor():
+    return ColumnTransformer(
+        transformers=[
+            ("num", "passthrough", NUMERIC_FEATURES),
+            (
+                "cat",
+                make_one_hot_encoder(),
+                CATEGORICAL_FEATURES,
+            ),
+        ],
+        remainder="drop",
+    )
+
+
+def choose_threshold(y_true, prob):
+    """
+    Chọn threshold trên VALIDATION bằng F1 tối đa.
+    Test không được dùng để tune threshold.
+    """
+    thresholds = np.linspace(0.05, 0.95, 181)
+
+    scores = [
+        f1_score(
+            y_true,
+            (prob >= t).astype(int),
+            zero_division=0,
+        )
+        for t in thresholds
+    ]
+
+    best_idx = int(np.argmax(scores))
+    return float(thresholds[best_idx])
+
+
+def evaluate_model(y_true, prob, threshold):
+    pred = (prob >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_true,
+        pred,
+        labels=[0, 1],
+    ).ravel()
+
+    return {
+        "threshold": float(threshold),
+        "accuracy": float(accuracy_score(y_true, pred)),
+        "precision": float(
+            precision_score(y_true, pred, zero_division=0)
+        ),
+        "recall": float(
+            recall_score(y_true, pred, zero_division=0)
+        ),
+        "f1": float(
+            f1_score(y_true, pred, zero_division=0)
+        ),
+        "roc_auc": float(
+            roc_auc_score(y_true, prob)
+        ),
+        "pr_auc": float(
+            average_precision_score(y_true, prob)
+        ),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
+    }
+
+
+def get_defaults(X_train):
+    defaults = {}
+
+    for col in NUMERIC_FEATURES:
+        defaults[col] = float(
+            pd.to_numeric(X_train[col]).median()
+        )
+
+    for col in CATEGORICAL_FEATURES:
+        mode = X_train[col].mode(dropna=True)
+        defaults[col] = mode.iloc[0] if len(mode) else None
+
+    return defaults
+
+
+# ============================================================
+# 2. TRAIN ALL MODELS
+# ============================================================
+
+def train_everything(df, category_levels):
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data(df)
+
+    models = {}
+    results = {}
+
+    # -------------------------
+    # Decision Tree
+    # -------------------------
+    tree = Pipeline(
+        [
+            ("prep", build_preprocessor()),
+            (
+                "model",
+                DecisionTreeClassifier(
+                    criterion="gini",
+                    max_depth=5,
+                    min_samples_leaf=20,
+                    class_weight="balanced",
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+
+    # -------------------------
+    # Bagging
+    # -------------------------
+    base_tree = DecisionTreeClassifier(
+        criterion="gini",
+        max_depth=5,
+        min_samples_leaf=20,
+        class_weight="balanced",
+        random_state=RANDOM_STATE,
+    )
+
+    bagging = Pipeline(
+        [
+            ("prep", build_preprocessor()),
+            ("model", make_bagging(base_tree)),
+        ]
+    )
+
+    # -------------------------
+    # Random Forest
+    # -------------------------
+    forest = Pipeline(
+        [
+            ("prep", build_preprocessor()),
+            (
+                "model",
+                RandomForestClassifier(
+                    n_estimators=250,
+                    max_depth=8,
+                    min_samples_leaf=10,
+                    max_features="sqrt",
+                    bootstrap=True,
+                    class_weight="balanced",
+                    random_state=RANDOM_STATE,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
+
+    sklearn_models = {
+        "Decision Tree": tree,
+        "Bagging": bagging,
+        "Random Forest": forest,
+    }
+
+    for name, model in sklearn_models.items():
+        model.fit(X_train, y_train)
+
+        val_prob = model.predict_proba(X_val)[:, 1]
+        threshold = choose_threshold(y_val, val_prob)
+
+        test_prob = model.predict_proba(X_test)[:, 1]
+
+        results[name] = evaluate_model(
+            y_test,
+            test_prob,
+            threshold,
+        )
+
+        models[name] = model
+
+    # -------------------------
+    # LightGBM
+    # -------------------------
+    negative = int((y_train == 0).sum())
+    positive = int((y_train == 1).sum())
+    scale_pos_weight = negative / positive
+
+    lgbm = lgb.LGBMClassifier(
+        objective="binary",
+        boosting_type="gbdt",
+        n_estimators=500,
+        learning_rate=0.03,
+        max_depth=5,
+        num_leaves=25,
+        min_child_samples=20,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_alpha=0.0,
+        reg_lambda=1.0,
+        scale_pos_weight=scale_pos_weight,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbosity=-1,
+    )
+
+    lgbm.fit(
+        X_train,
+        y_train,
+        categorical_feature=CATEGORICAL_FEATURES,
+        eval_set=[(X_val, y_val)],
+        eval_metric="binary_logloss",
+        callbacks=[
+            lgb.early_stopping(
+                40,
+                verbose=False,
+            )
+        ],
+    )
+
+    val_prob = lgbm.predict_proba(X_val)[:, 1]
+    threshold = choose_threshold(y_val, val_prob)
+
+    test_prob = lgbm.predict_proba(X_test)[:, 1]
+
+    results["LightGBM"] = evaluate_model(
+        y_test,
+        test_prob,
+        threshold,
+    )
+
+    models["LightGBM"] = lgbm
+
+    # -------------------------
+    # LightGBM feature importance
+    # -------------------------
+    gain = lgbm.booster_.feature_importance(
+        importance_type="gain"
+    )
+
+    split = lgbm.booster_.feature_importance(
+        importance_type="split"
+    )
+
+    names = lgbm.booster_.feature_name()
+
+    gain_total = float(np.sum(gain)) or 1.0
+
+    importance = pd.DataFrame(
+        {
+            "feature": names,
+            "gain": gain.astype(float),
+            "gain_pct": gain / gain_total * 100,
+            "split": split.astype(int),
+        }
+    ).sort_values("gain", ascending=False)
+
+    ranking = sorted(
+        results.items(),
+        key=lambda kv: kv[1]["pr_auc"],
+        reverse=True,
+    )
+
+    recommended_model = ranking[0][0]
+
+    bundle = {
+        "models": models,
+        "metrics": results,
+        "recommended_model": recommended_model,
+        "feature_order": list(X_train.columns),
+        "numeric_features": NUMERIC_FEATURES,
+        "categorical_features": CATEGORICAL_FEATURES,
+        "category_levels": category_levels,
+        "defaults": get_defaults(X_train),
+        "dataset_summary": {
+            "rows": int(len(df)),
+            "features": int(df.shape[1] - 1),
+            "positive": int(df[TARGET].sum()),
+            "negative": int((1 - df[TARGET]).sum()),
+            "positive_rate": float(df[TARGET].mean()),
+            "train": int(len(X_train)),
+            "validation": int(len(X_val)),
+            "test": int(len(X_test)),
+        },
+        "scale_pos_weight": float(scale_pos_weight),
+        "lgbm_best_iteration": int(
+            lgbm.best_iteration_
+            or lgbm.n_estimators
+        ),
+        "lgbm_feature_importance": importance,
+        "trained_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+    }
+
+    return bundle
+
+
+# ============================================================
+# 3. PREDICTION + EXPLAINABILITY
+# ============================================================
+
+def restore_lgbm_categories(df, bundle):
+    df = df.copy()
+
+    for col in bundle["categorical_features"]:
+        df[col] = pd.Categorical(
+            df[col],
+            categories=bundle[
+                "category_levels"
+            ][col],
+        )
+
+    return df
+
+
+def score_one(model_name, row_df, bundle):
+    model = bundle["models"][model_name]
+
+    x = row_df.copy()
+
+    if model_name == "LightGBM":
+        x = restore_lgbm_categories(
+            x,
+            bundle,
+        )
+
+    score = float(
+        model.predict_proba(x)[0, 1]
+    )
+
+    threshold = float(
+        bundle["metrics"][
+            model_name
+        ]["threshold"]
+    )
+
+    pred = int(score >= threshold)
+
+    return score, threshold, pred
 
 
 def sigmoid(x):
-    # ổn định số học
     if x >= 0:
         z = math.exp(-x)
         return 1 / (1 + z)
+
     z = math.exp(x)
     return z / (1 + z)
 
 
-def restore_lgbm_categories(df, bundle):
-    """
-    Khôi phục ĐÚNG category dtype mà LightGBM đã học.
-    Không đổi 2 -> "2", False -> "False".
-    """
-    df = df.copy()
-    for col in bundle["categorical_features"]:
-        levels = bundle["category_levels"][col]
-        df[col] = pd.Categorical(df[col], categories=levels)
-    return df
-
-
-def make_baseline_row(bundle):
-    row = dict(bundle["defaults"])
-    # bảo đảm đúng thứ tự feature
-    return {col: row[col] for col in bundle["feature_order"]}
-
-
-def score_one(model_name, input_df, bundle):
-    model = bundle["models"][model_name]
-
-    if model_name == "LightGBM":
-        input_df = restore_lgbm_categories(input_df, bundle)
-
-    prob = float(model.predict_proba(input_df)[0, 1])
-    threshold = float(bundle["metrics"][model_name]["threshold"])
-    pred = int(prob >= threshold)
-    return prob, threshold, pred
-
-
-def local_lgbm_contributions(input_df, bundle):
-    """
-    LightGBM pred_contrib=True trả về SHAP-style contributions
-    trên RAW SCORE (log-odds / margin) scale.
-    Tổng feature contributions + expected value = raw score.
-    """
+def get_lgbm_contributions(row_df, bundle):
     model = bundle["models"]["LightGBM"]
-    x = restore_lgbm_categories(input_df, bundle)
 
-    contrib = model.booster_.predict(x, pred_contrib=True)[0]
-    feature_names = bundle["feature_order"]
+    x = restore_lgbm_categories(
+        row_df,
+        bundle,
+    )
 
-    values = contrib[:-1]
-    expected = float(contrib[-1])
-    raw_score = expected + float(np.sum(values))
+    contrib = model.booster_.predict(
+        x,
+        pred_contrib=True,
+    )[0]
 
-    out = pd.DataFrame({
-        "feature": feature_names,
-        "contribution_raw_score": values.astype(float),
-        "abs_contribution": np.abs(values.astype(float)),
-    }).sort_values("abs_contribution", ascending=False)
+    feature_values = np.asarray(
+        contrib[:-1],
+        dtype=float,
+    )
 
-    return expected, raw_score, out
+    base = float(contrib[-1])
+    raw_score = base + float(
+        feature_values.sum()
+    )
+
+    contrib_df = pd.DataFrame(
+        {
+            "feature": bundle[
+                "feature_order"
+            ],
+            "contribution": feature_values,
+            "abs_contribution": np.abs(
+                feature_values
+            ),
+        }
+    ).sort_values(
+        "abs_contribution",
+        ascending=False,
+    )
+
+    return base, raw_score, contrib_df
 
 
-def fmt_pct(x):
-    return f"{100*x:.1f}%"
+# ============================================================
+# 4. SERIALIZATION
+# ============================================================
+
+def serialize_bundle(bundle) -> bytes:
+    buffer = BytesIO()
+    joblib.dump(
+        bundle,
+        buffer,
+        compress=3,
+    )
+    return buffer.getvalue()
 
 
-try:
-    bundle = load_bundle()
-except Exception as e:
-    st.error(f"Không thể load `{BUNDLE_FILE}`: {e}")
-    st.stop()
+def make_metrics_json(bundle) -> str:
+    payload = {
+        "updated_at_utc": datetime.now(
+            timezone.utc
+        ).isoformat(),
+        "recommended_model": bundle[
+            "recommended_model"
+        ],
+        "scale_pos_weight": bundle.get(
+            "scale_pos_weight"
+        ),
+        "lgbm_best_iteration": bundle.get(
+            "lgbm_best_iteration"
+        ),
+        "dataset_summary": bundle.get(
+            "dataset_summary"
+        ),
+        "metrics": bundle.get(
+            "metrics"
+        ),
+    }
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
-st.title("🛒 Dự đoán khả năng mua hàng — Tree Ensembles")
-st.caption(
-    "Decision Tree → Bagging → Random Forest → LightGBM. "
-    "Mục tiêu: hiểu được mô hình, demo được, và map được code ↔ toán."
+# ============================================================
+# 5. GITHUB API — SAME FILE
+# ============================================================
+
+def get_github_config():
+    if "GITHUB_TOKEN" not in st.secrets:
+        raise RuntimeError(
+            "Thiếu GITHUB_TOKEN trong Streamlit Secrets."
+        )
+
+    repo = st.secrets.get(
+        "GITHUB_REPO",
+        DEFAULT_GITHUB_REPO,
+    )
+
+    branch = st.secrets.get(
+        "GITHUB_BRANCH",
+        DEFAULT_GITHUB_BRANCH,
+    )
+
+    return {
+        "token": st.secrets["GITHUB_TOKEN"],
+        "repo": repo,
+        "branch": branch,
+    }
+
+
+def github_headers(token):
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "math4ai-streamlit",
+    }
+
+
+def github_contents_url(repo, path):
+    clean_path = path.lstrip("/")
+    return (
+        f"https://api.github.com/"
+        f"repos/{repo}/contents/{clean_path}"
+    )
+
+
+def github_get_file_sha(
+    token,
+    repo,
+    branch,
+    path,
+):
+    response = requests.get(
+        github_contents_url(
+            repo,
+            path,
+        ),
+        headers=github_headers(token),
+        params={"ref": branch},
+        timeout=30,
+    )
+
+    if response.status_code == 404:
+        return None
+
+    if not response.ok:
+        raise RuntimeError(
+            "GitHub GET lỗi "
+            f"{response.status_code}: "
+            f"{response.text}"
+        )
+
+    return response.json().get("sha")
+
+
+def github_upsert_bytes(
+    token,
+    repo,
+    branch,
+    path,
+    content,
+    commit_message,
+):
+    sha = github_get_file_sha(
+        token,
+        repo,
+        branch,
+        path,
+    )
+
+    payload = {
+        "message": commit_message,
+        "content": base64.b64encode(
+            content
+        ).decode("ascii"),
+        "branch": branch,
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    response = requests.put(
+        github_contents_url(
+            repo,
+            path,
+        ),
+        headers=github_headers(token),
+        json=payload,
+        timeout=120,
+    )
+
+    if not response.ok:
+        raise RuntimeError(
+            "GitHub PUT lỗi "
+            f"{response.status_code}: "
+            f"{response.text}"
+        )
+
+    return response.json()
+
+
+def github_upsert_text(
+    token,
+    repo,
+    branch,
+    path,
+    text,
+    commit_message,
+):
+    return github_upsert_bytes(
+        token,
+        repo,
+        branch,
+        path,
+        text.encode("utf-8"),
+        commit_message,
+    )
+
+
+def push_bundle_to_github(bundle):
+    config = get_github_config()
+
+    stamp = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+    model_bytes = serialize_bundle(
+        bundle
+    )
+
+    metrics_text = make_metrics_json(
+        bundle
+    )
+
+    model_result = github_upsert_bytes(
+        token=config["token"],
+        repo=config["repo"],
+        branch=config["branch"],
+        path=MODEL_PATH_IN_REPO,
+        content=model_bytes,
+        commit_message=(
+            f"Update trained model - {stamp}"
+        ),
+    )
+
+    metrics_result = github_upsert_text(
+        token=config["token"],
+        repo=config["repo"],
+        branch=config["branch"],
+        path=METRICS_PATH_IN_REPO,
+        text=metrics_text,
+        commit_message=(
+            f"Update ML metrics - {stamp}"
+        ),
+    )
+
+    return {
+        "repo": config["repo"],
+        "branch": config["branch"],
+        "model_commit_url": (
+            model_result["commit"]["html_url"]
+        ),
+        "metrics_commit_url": (
+            metrics_result["commit"]["html_url"]
+        ),
+    }
+
+
+# ============================================================
+# 6. SESSION STATE
+# ============================================================
+
+if "dataset" not in st.session_state:
+    st.session_state["dataset"] = None
+
+if "dataset_name" not in st.session_state:
+    st.session_state["dataset_name"] = None
+
+if "bundle" not in st.session_state:
+    st.session_state["bundle"] = None
+
+
+# ============================================================
+# 7. HEADER
+# ============================================================
+
+st.title(
+    "🛒 Online Shopper Purchase Prediction — ML Lab"
 )
 
-tabs = st.tabs([
-    "1️⃣ Bài toán & Dữ liệu",
-    "2️⃣ So sánh Model",
-    "3️⃣ Live Prediction",
-    "4️⃣ Giải thích Prediction",
-    "5️⃣ Code ↔ Toán",
-    "6️⃣ Audit Notes",
-])
+st.caption(
+    "Một app.py duy nhất: "
+    "Upload → Train → Evaluate → Predict → Explain → "
+    "Commit model lên GitHub."
+)
 
 
-# ==========================================================
-# TAB 1
-# ==========================================================
+# ============================================================
+# 8. SIDEBAR
+# ============================================================
+
+with st.sidebar:
+    st.header("⚙️ Pipeline")
+
+    uploaded = st.file_uploader(
+        "Upload online_shoppers.csv",
+        type=["csv"],
+    )
+
+    if uploaded is not None:
+        try:
+            st.session_state[
+                "dataset"
+            ] = pd.read_csv(
+                uploaded
+            )
+
+            st.session_state[
+                "dataset_name"
+            ] = uploaded.name
+
+            st.success(
+                f"Đã nạp {uploaded.name}"
+            )
+
+        except Exception as e:
+            st.error(
+                f"Không đọc được CSV: {e}"
+            )
+
+    # Nếu CSV đã nằm trong repo thì tự đọc.
+    if st.session_state["dataset"] is None:
+        for filename in [
+            "online_shoppers.csv",
+            "online_shoppers(1).csv",
+        ]:
+            if os.path.exists(filename):
+                st.session_state[
+                    "dataset"
+                ] = pd.read_csv(
+                    filename
+                )
+
+                st.session_state[
+                    "dataset_name"
+                ] = filename
+
+                st.info(
+                    f"Tự động dùng `{filename}`"
+                )
+                break
+
+    if st.session_state["dataset"] is None:
+        st.warning(
+            "Upload dataset hoặc đặt "
+            "`online_shoppers.csv` trong repo."
+        )
+
+    else:
+        st.write(
+            "**Dataset:** "
+            f"{st.session_state['dataset_name']}"
+        )
+
+        st.write(
+            "**Rows:** "
+            f"{len(st.session_state['dataset']):,}"
+        )
+
+        train_only = st.button(
+            "🧠 Train chỉ trong Streamlit",
+            use_container_width=True,
+        )
+
+        train_and_push = st.button(
+            "🚀 Train + cập nhật GitHub",
+            type="primary",
+            use_container_width=True,
+        )
+
+        if train_only or train_and_push:
+            try:
+                with st.spinner(
+                    "Đang chuẩn hóa dữ liệu..."
+                ):
+                    clean_df, category_levels = (
+                        normalize_dataset(
+                            st.session_state[
+                                "dataset"
+                            ]
+                        )
+                    )
+
+                with st.spinner(
+                    "Đang train Decision Tree, "
+                    "Bagging, Random Forest, LightGBM..."
+                ):
+                    bundle = train_everything(
+                        clean_df,
+                        category_levels,
+                    )
+
+                st.session_state[
+                    "dataset"
+                ] = clean_df
+
+                st.session_state[
+                    "bundle"
+                ] = bundle
+
+                st.success(
+                    "✅ Train hoàn tất."
+                )
+
+                if train_and_push:
+                    with st.spinner(
+                        "Đang cập nhật GitHub..."
+                    ):
+                        pushed = (
+                            push_bundle_to_github(
+                                bundle
+                            )
+                        )
+
+                    st.success(
+                        "✅ Model + metrics đã "
+                        "được commit lên GitHub."
+                    )
+
+                    st.link_button(
+                        "🔗 Xem commit model",
+                        pushed[
+                            "model_commit_url"
+                        ],
+                        use_container_width=True,
+                    )
+
+                    st.link_button(
+                        "🔗 Xem commit metrics",
+                        pushed[
+                            "metrics_commit_url"
+                        ],
+                        use_container_width=True,
+                    )
+
+            except Exception as e:
+                st.exception(e)
+
+    if st.session_state["bundle"] is not None:
+        st.divider()
+
+        bundle_bytes = serialize_bundle(
+            st.session_state[
+                "bundle"
+            ]
+        )
+
+        st.download_button(
+            "⬇️ Tải model bundle",
+            data=bundle_bytes,
+            file_name=(
+                "purchase_model_bundle.joblib"
+            ),
+            mime=(
+                "application/octet-stream"
+            ),
+            use_container_width=True,
+        )
+
+
+# ============================================================
+# 9. TABS
+# ============================================================
+
+tabs = st.tabs(
+    [
+        "1️⃣ Problem & EDA",
+        "2️⃣ Training",
+        "3️⃣ Model Comparison",
+        "4️⃣ Live Prediction",
+        "5️⃣ Explain Prediction",
+        "6️⃣ Code ↔ Math",
+        "7️⃣ GitHub",
+    ]
+)
+
+
+# ============================================================
+# TAB 1 — EDA
+# ============================================================
+
 with tabs[0]:
-    summary = bundle["dataset_summary"]
+    st.header("1. Bài toán và dữ liệu")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Số phiên truy cập", f"{summary['n_rows']:,}")
-    c2.metric("Số feature", summary["n_features"])
-    c3.metric("Khách mua", f"{summary['positive']:,}")
-    c4.metric("Tỷ lệ mua", fmt_pct(summary["positive_rate"]))
+    st.markdown(
+        r"""
+### Bài toán
 
-    st.markdown("""
-### Câu hỏi của bài toán
-
-Từ hành vi của **một phiên truy cập website**, dự đoán:
+Dựa trên hành vi của một phiên truy cập website:
 
 \[
 Y = Revenue \in \{0,1\}
 \]
 
-- \(Y=1\): phiên truy cập kết thúc bằng mua hàng.
+- \(Y=1\): mua hàng.
 - \(Y=0\): không mua.
 
-Đây là **binary classification** và dữ liệu bị **mất cân bằng lớp**, nên không nên chỉ nhìn Accuracy.
-""")
-
-    st.markdown("### Cách chia dữ liệu")
-    split_df = pd.DataFrame({
-        "Tập": ["Train", "Validation", "Test"],
-        "Số mẫu": [
-            summary["split"]["train"],
-            summary["split"]["validation"],
-            summary["split"]["test"],
-        ],
-        "Dùng để làm gì": [
-            "Fit tham số/model",
-            "Chọn threshold + early stopping",
-            "Đánh giá cuối cùng, không tune",
-        ],
-    })
-    st.dataframe(split_df, use_container_width=True, hide_index=True)
-
-    st.info(
-        "Điểm thiết kế quan trọng: threshold được chọn trên Validation, "
-        "không dùng Test để tune."
+Đây là bài toán **binary classification**.
+"""
     )
 
-    st.warning(bundle["notes"]["pagevalues_warning"])
-
-
-# ==========================================================
-# TAB 2
-# ==========================================================
-with tabs[1]:
-    st.subheader("So sánh công bằng 4 họ model")
-
-    metrics = pd.DataFrame(bundle["metrics"]).T.reset_index()
-    metrics = metrics.rename(columns={"index": "Model"})
-
-    show_cols = [
-        "Model", "pr_auc", "roc_auc", "precision", "recall",
-        "f1", "accuracy", "threshold"
+    df = st.session_state[
+        "dataset"
     ]
-    display = metrics[show_cols].copy()
-    for col in show_cols[1:]:
-        display[col] = display[col].astype(float).round(4)
 
-    st.dataframe(
-        display.sort_values("pr_auc", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.success(
-        f"Model được đề xuất theo **PR-AUC**: "
-        f"**{bundle['recommended_model']}**"
-    )
-
-    metric_to_plot = st.selectbox(
-        "Metric để so sánh",
-        ["pr_auc", "roc_auc", "f1", "recall", "precision", "accuracy"],
-    )
-
-    fig = px.bar(
-        metrics.sort_values(metric_to_plot),
-        x=metric_to_plot,
-        y="Model",
-        orientation="h",
-        text=metric_to_plot,
-        title=f"So sánh {metric_to_plot.upper()}",
-    )
-    fig.update_traces(texttemplate="%{text:.3f}", textposition="outside")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("""
-### Vì sao cần 4 model?
-
-**Decision Tree**  
-Một cây duy nhất, dễ hiểu nhưng variance cao.
-
-**Bagging**  
-Nhiều cây học trên các bootstrap samples độc lập rồi vote.
-
-\[
-\hat y = mode(h_1(x),...,h_B(x))
-\]
-
-**Random Forest**  
-Bagging + random subset of features tại mỗi split → các cây bớt tương quan.
-
-**Boosting / LightGBM**  
-Các cây được thêm **tuần tự**, cây sau sửa phần lỗi còn lại của ensemble trước:
-
-\[
-F_m(x)=F_{m-1}(x)+\eta f_m(x)
-\]
-""")
-
-    st.markdown("### LightGBM Feature Importance")
-
-    imp = bundle["lgbm_feature_importance"].copy()
-    importance_type = st.radio(
-        "Kiểu importance",
-        ["Gain", "Split"],
-        horizontal=True,
-    )
-
-    if importance_type == "Gain":
-        plot_df = imp.nlargest(12, "gain_pct").sort_values("gain_pct")
-        fig = px.bar(
-            plot_df,
-            x="gain_pct",
-            y="feature",
-            orientation="h",
-            text="gain_pct",
-            title="Gain importance — tổng mức cải thiện objective",
-        )
-        fig.update_traces(texttemplate="%{text:.1f}%")
-        st.caption(
-            "Gain ≠ hướng tác động. Gain cao chỉ nói feature giúp giảm objective nhiều."
+    if df is None:
+        st.info(
+            "Upload dataset ở sidebar."
         )
     else:
-        plot_df = imp.nlargest(12, "split").sort_values("split")
-        fig = px.bar(
-            plot_df,
-            x="split",
-            y="feature",
-            orientation="h",
-            text="split",
-            title="Split importance — số lần feature được dùng để chia nhánh",
+        try:
+            preview, _ = normalize_dataset(
+                df
+            )
+        except Exception:
+            preview = df.copy()
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Rows",
+            f"{len(preview):,}",
         )
-        st.caption(
-            "Split importance không có nghĩa feature làm xác suất tăng/giảm."
+
+        c2.metric(
+            "Features",
+            max(
+                0,
+                preview.shape[1] - 1,
+            ),
         )
 
-    st.plotly_chart(fig, use_container_width=True)
+        c3.metric(
+            "Missing cells",
+            int(
+                preview.isna()
+                .sum()
+                .sum()
+            ),
+        )
 
-
-# ==========================================================
-# TAB 3
-# ==========================================================
-with tabs[2]:
-    st.subheader("Live Prediction")
-
-    model_name = st.selectbox(
-        "Chọn model",
-        list(bundle["models"].keys()),
-        index=list(bundle["models"].keys()).index(bundle["recommended_model"]),
-    )
-
-    mode = st.radio(
-        "Chế độ nhập",
-        ["Simple Demo", "Full 17 Features"],
-        horizontal=True,
-    )
-
-    baseline = make_baseline_row(bundle)
-
-    st.caption(
-        "Simple Demo: feature không nhập sẽ dùng median/mode của TRAIN. "
-        "App không tự bịa giá trị như `ExitRates = BounceRates + 0.01`."
-    )
-
-    with st.form("prediction_form"):
-        row = dict(baseline)
-
-        if mode == "Simple Demo":
-            c1, c2 = st.columns(2)
-
-            with c1:
-                row["ProductRelated"] = st.number_input(
-                    "Số trang sản phẩm đã xem",
-                    min_value=0,
-                    value=int(baseline["ProductRelated"]),
-                    step=1,
-                )
-                row["ProductRelated_Duration"] = st.number_input(
-                    "Thời gian xem trang sản phẩm (giây)",
-                    min_value=0.0,
-                    value=float(baseline["ProductRelated_Duration"]),
-                    step=10.0,
-                )
-                row["PageValues"] = st.number_input(
-                    "PageValues",
-                    min_value=0.0,
-                    value=float(baseline["PageValues"]),
-                    step=1.0,
-                    help=(
-                        "Feature rất mạnh. Cần xác nhận nó có sẵn tại đúng "
-                        "thời điểm business muốn dự đoán."
-                    ),
-                )
-                row["BounceRates"] = st.number_input(
-                    "BounceRates",
-                    min_value=0.0,
-                    value=float(baseline["BounceRates"]),
-                    step=0.001,
-                    format="%.4f",
-                )
-                row["ExitRates"] = st.number_input(
-                    "ExitRates",
-                    min_value=0.0,
-                    value=float(baseline["ExitRates"]),
-                    step=0.001,
-                    format="%.4f",
+        if TARGET in preview.columns:
+            try:
+                rate = float(
+                    preview[
+                        TARGET
+                    ].astype(int).mean()
                 )
 
-            with c2:
-                levels = bundle["category_levels"]
-                row["Month"] = st.selectbox(
-                    "Month",
-                    levels["Month"],
-                    index=levels["Month"].index(baseline["Month"]),
+                c4.metric(
+                    "Purchase rate",
+                    f"{rate*100:.2f}%",
                 )
-                row["VisitorType"] = st.selectbox(
-                    "VisitorType",
-                    levels["VisitorType"],
-                    index=levels["VisitorType"].index(baseline["VisitorType"]),
-                )
-                row["Weekend"] = st.selectbox(
-                    "Weekend",
-                    levels["Weekend"],
-                    index=levels["Weekend"].index(baseline["Weekend"]),
-                )
-                row["Region"] = st.selectbox(
-                    "Region",
-                    levels["Region"],
-                    index=levels["Region"].index(baseline["Region"]),
+            except Exception:
+                c4.metric(
+                    "Purchase rate",
+                    "N/A",
                 )
 
-        else:
-            st.markdown("#### Numeric features")
-            cols = st.columns(2)
-            for i, col in enumerate(bundle["numeric_features"]):
-                val = baseline[col]
-                row[col] = cols[i % 2].number_input(
-                    col,
-                    value=float(val),
-                    step=1.0 if float(val).is_integer() else 0.01,
-                    key=f"full_num_{col}",
-                )
-
-            st.markdown("#### Categorical features")
-            cols = st.columns(2)
-            for i, col in enumerate(bundle["categorical_features"]):
-                levels = bundle["category_levels"][col]
-                default = baseline[col]
-                idx = levels.index(default) if default in levels else 0
-                row[col] = cols[i % 2].selectbox(
-                    col,
-                    levels,
-                    index=idx,
-                    key=f"full_cat_{col}",
-                )
-
-        submitted = st.form_submit_button(
-            "Dự đoán",
+        st.dataframe(
+            preview.head(20),
             use_container_width=True,
         )
 
-    if submitted:
-        input_df = pd.DataFrame(
-            [[row[col] for col in bundle["feature_order"]]],
-            columns=bundle["feature_order"],
-        )
+        if TARGET in preview.columns:
+            target_counts = (
+                preview[TARGET]
+                .astype(str)
+                .value_counts()
+                .rename_axis(
+                    "Revenue"
+                )
+                .reset_index(
+                    name="Count"
+                )
+            )
 
-        prob, threshold, pred = score_one(
-            model_name,
-            input_df,
-            bundle,
-        )
+            fig = px.bar(
+                target_counts,
+                x="Revenue",
+                y="Count",
+                text="Count",
+                title=(
+                    "Phân bố target Revenue"
+                ),
+            )
 
-        st.session_state["last_input"] = input_df
-        st.session_state["last_model"] = model_name
-        st.session_state["last_prob"] = prob
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+            )
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric(
-            "Model score cho lớp Mua",
-            fmt_pct(prob),
-        )
-        c2.metric("Decision threshold", f"{threshold:.3f}")
-        c3.metric(
-            "Prediction",
-            "MUA (1)" if pred else "KHÔNG MUA (0)",
-        )
-
-        st.progress(max(0.0, min(1.0, prob)))
-
-        st.warning(
-            "Không tự động gọi score này là 'xác suất mua thật'. "
-            "Đặc biệt LightGBM dùng class weighting; muốn diễn giải xác suất "
-            "cần đánh giá/calibrate probability."
-        )
-
-        with st.expander("Xem input thực sự đưa vào model"):
-            st.dataframe(input_df, use_container_width=True, hide_index=True)
+            st.warning(
+                "Target mất cân bằng → "
+                "không chỉ nhìn Accuracy. "
+                "Ưu tiên PR-AUC, Recall, F1."
+            )
 
 
-# ==========================================================
-# TAB 4
-# ==========================================================
-with tabs[3]:
-    st.subheader("Giải thích prediction thật — không dùng rule viết tay")
+# ============================================================
+# TAB 2 — TRAINING
+# ============================================================
 
-    if "last_input" not in st.session_state:
+with tabs[1]:
+    st.header("2. Training")
+
+    bundle = st.session_state[
+        "bundle"
+    ]
+
+    st.markdown(
+        r"""
+### Data split
+
+\[
+Train = 70\%
+\]
+
+\[
+Validation = 15\%
+\]
+
+\[
+Test = 15\%
+\]
+
+- Train: học model.
+- Validation: early stopping + chọn threshold.
+- Test: đánh giá cuối.
+"""
+    )
+
+    if bundle is None:
         st.info(
-            "Hãy chạy một prediction ở tab **Live Prediction** trước."
+            "Bấm Train ở sidebar."
         )
     else:
-        input_df = st.session_state["last_input"]
-
-        st.markdown("""
-Phần này dùng **native LightGBM contribution (`pred_contrib=True`)**.
-Đây là SHAP-style decomposition trên **raw-score scale**:
-
-\[
-F(x)=E[F(x)] + \sum_j \phi_j
-\]
-
-sau đó:
-
-\[
-score = \sigma(F(x))
-\]
-
-- \(\phi_j>0\): feature đẩy model về phía lớp **Mua**.
-- \(\phi_j<0\): feature đẩy model về phía **Không mua**.
-""")
-
-        expected, raw_score, contrib_df = local_lgbm_contributions(
-            input_df,
-            bundle,
-        )
-        lgb_score = sigmoid(raw_score)
+        s = bundle[
+            "dataset_summary"
+        ]
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("Base raw score", f"{expected:.4f}")
-        c2.metric("Final raw score", f"{raw_score:.4f}")
-        c3.metric("Sigmoid(raw score)", fmt_pct(lgb_score))
 
-        top_n = st.slider("Số feature muốn xem", 5, 17, 10)
-        top = contrib_df.head(top_n).copy()
-        top["direction"] = np.where(
-            top["contribution_raw_score"] >= 0,
-            "Đẩy về Mua",
-            "Đẩy về Không mua",
+        c1.metric(
+            "Train",
+            s["train"],
         )
-        top = top.sort_values("contribution_raw_score")
 
-        fig = px.bar(
-            top,
-            x="contribution_raw_score",
-            y="feature",
-            orientation="h",
-            color="direction",
-            title="Local feature contributions của chính prediction này",
+        c2.metric(
+            "Validation",
+            s["validation"],
         )
-        st.plotly_chart(fig, use_container_width=True)
+
+        c3.metric(
+            "Test",
+            s["test"],
+        )
+
+        c1, c2 = st.columns(2)
+
+        c1.metric(
+            "scale_pos_weight",
+            (
+                f"{bundle['scale_pos_weight']:.3f}"
+            ),
+        )
+
+        c2.metric(
+            "LightGBM best iteration",
+            bundle[
+                "lgbm_best_iteration"
+            ],
+        )
+
+
+# ============================================================
+# TAB 3 — COMPARISON
+# ============================================================
+
+with tabs[2]:
+    st.header("3. Model Comparison")
+
+    bundle = st.session_state[
+        "bundle"
+    ]
+
+    if bundle is None:
+        st.info(
+            "Train model trước."
+        )
+    else:
+        metrics = (
+            pd.DataFrame(
+                bundle["metrics"]
+            )
+            .T
+            .reset_index()
+            .rename(
+                columns={
+                    "index": "Model"
+                }
+            )
+        )
+
+        cols = [
+            "Model",
+            "pr_auc",
+            "roc_auc",
+            "precision",
+            "recall",
+            "f1",
+            "accuracy",
+            "threshold",
+        ]
+
+        table = metrics[
+            cols
+        ].copy()
+
+        for col in cols[1:]:
+            table[col] = (
+                table[col]
+                .astype(float)
+                .round(4)
+            )
 
         st.dataframe(
-            contrib_df[
-                ["feature", "contribution_raw_score"]
-            ].round(5),
+            table.sort_values(
+                "pr_auc",
+                ascending=False,
+            ),
             use_container_width=True,
             hide_index=True,
         )
 
         st.success(
-            "Khác với các câu kiểu 'tháng 11 thì cộng điểm', biểu đồ trên "
-            "được lấy trực tiếp từ model cho chính input đang dự đoán."
+            "Model tốt nhất theo PR-AUC: "
+            f"**{bundle['recommended_model']}**"
+        )
+
+        metric_name = st.selectbox(
+            "Metric",
+            [
+                "pr_auc",
+                "roc_auc",
+                "f1",
+                "recall",
+                "precision",
+                "accuracy",
+            ],
+        )
+
+        fig = px.bar(
+            metrics.sort_values(
+                metric_name
+            ),
+            x=metric_name,
+            y="Model",
+            orientation="h",
+            text=metric_name,
+            title=(
+                f"So sánh "
+                f"{metric_name.upper()}"
+            ),
+        )
+
+        fig.update_traces(
+            texttemplate=(
+                "%{text:.3f}"
+            ),
+            textposition="outside",
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+        )
+
+        st.subheader(
+            "LightGBM Feature Importance"
+        )
+
+        imp_mode = st.radio(
+            "Importance",
+            ["Gain", "Split"],
+            horizontal=True,
+        )
+
+        imp = bundle[
+            "lgbm_feature_importance"
+        ].copy()
+
+        if imp_mode == "Gain":
+            plot_df = (
+                imp.nlargest(
+                    12,
+                    "gain_pct",
+                )
+                .sort_values(
+                    "gain_pct"
+                )
+            )
+
+            fig = px.bar(
+                plot_df,
+                x="gain_pct",
+                y="feature",
+                orientation="h",
+                text="gain_pct",
+                title=(
+                    "Gain importance"
+                ),
+            )
+
+            fig.update_traces(
+                texttemplate=(
+                    "%{text:.1f}%"
+                )
+            )
+
+            st.caption(
+                "Gain ≠ hướng tác động."
+            )
+
+        else:
+            plot_df = (
+                imp.nlargest(
+                    12,
+                    "split",
+                )
+                .sort_values(
+                    "split"
+                )
+            )
+
+            fig = px.bar(
+                plot_df,
+                x="split",
+                y="feature",
+                orientation="h",
+                text="split",
+                title=(
+                    "Split importance"
+                ),
+            )
+
+            st.caption(
+                "Split = số lần "
+                "feature được dùng."
+            )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
         )
 
 
-# ==========================================================
-# TAB 5
-# ==========================================================
+# ============================================================
+# TAB 4 — LIVE PREDICTION
+# ============================================================
+
+with tabs[3]:
+    st.header("4. Live Prediction")
+
+    bundle = st.session_state[
+        "bundle"
+    ]
+
+    if bundle is None:
+        st.info(
+            "Train model trước."
+        )
+    else:
+        model_name = st.selectbox(
+            "Model",
+            list(
+                bundle[
+                    "models"
+                ].keys()
+            ),
+            index=list(
+                bundle[
+                    "models"
+                ].keys()
+            ).index(
+                bundle[
+                    "recommended_model"
+                ]
+            ),
+        )
+
+        mode = st.radio(
+            "Input mode",
+            [
+                "Simple Demo",
+                "Full 17 Features",
+            ],
+            horizontal=True,
+        )
+
+        row = dict(
+            bundle[
+                "defaults"
+            ]
+        )
+
+        st.info(
+            "Simple Demo dùng median/mode "
+            "của TRAIN cho feature không nhập."
+        )
+
+        with st.form(
+            "prediction_form"
+        ):
+            if mode == "Simple Demo":
+                c1, c2 = st.columns(2)
+
+                with c1:
+                    row[
+                        "ProductRelated"
+                    ] = st.number_input(
+                        "ProductRelated",
+                        min_value=0,
+                        value=int(
+                            bundle[
+                                "defaults"
+                            ][
+                                "ProductRelated"
+                            ]
+                        ),
+                        step=1,
+                    )
+
+                    row[
+                        "ProductRelated_Duration"
+                    ] = st.number_input(
+                        "ProductRelated_Duration",
+                        min_value=0.0,
+                        value=float(
+                            bundle[
+                                "defaults"
+                            ][
+                                "ProductRelated_Duration"
+                            ]
+                        ),
+                    )
+
+                    row[
+                        "PageValues"
+                    ] = st.number_input(
+                        "PageValues",
+                        min_value=0.0,
+                        value=float(
+                            bundle[
+                                "defaults"
+                            ][
+                                "PageValues"
+                            ]
+                        ),
+                    )
+
+                    row[
+                        "BounceRates"
+                    ] = st.number_input(
+                        "BounceRates",
+                        min_value=0.0,
+                        value=float(
+                            bundle[
+                                "defaults"
+                            ][
+                                "BounceRates"
+                            ]
+                        ),
+                        format="%.4f",
+                    )
+
+                    row[
+                        "ExitRates"
+                    ] = st.number_input(
+                        "ExitRates",
+                        min_value=0.0,
+                        value=float(
+                            bundle[
+                                "defaults"
+                            ][
+                                "ExitRates"
+                            ]
+                        ),
+                        format="%.4f",
+                    )
+
+                with c2:
+                    for col in [
+                        "Month",
+                        "VisitorType",
+                        "Weekend",
+                        "Region",
+                    ]:
+                        levels = bundle[
+                            "category_levels"
+                        ][col]
+
+                        default = bundle[
+                            "defaults"
+                        ][col]
+
+                        idx = (
+                            levels.index(
+                                default
+                            )
+                            if default
+                            in levels
+                            else 0
+                        )
+
+                        row[col] = (
+                            st.selectbox(
+                                col,
+                                levels,
+                                index=idx,
+                                key=(
+                                    f"simple_{col}"
+                                ),
+                            )
+                        )
+
+            else:
+                st.markdown(
+                    "#### Numeric"
+                )
+
+                num_cols = st.columns(2)
+
+                for i, col in enumerate(
+                    bundle[
+                        "numeric_features"
+                    ]
+                ):
+                    default = float(
+                        bundle[
+                            "defaults"
+                        ][col]
+                    )
+
+                    row[col] = (
+                        num_cols[
+                            i % 2
+                        ].number_input(
+                            col,
+                            value=default,
+                            key=(
+                                f"num_{col}"
+                            ),
+                        )
+                    )
+
+                st.markdown(
+                    "#### Categorical"
+                )
+
+                cat_cols = st.columns(2)
+
+                for i, col in enumerate(
+                    bundle[
+                        "categorical_features"
+                    ]
+                ):
+                    levels = bundle[
+                        "category_levels"
+                    ][col]
+
+                    default = bundle[
+                        "defaults"
+                    ][col]
+
+                    idx = (
+                        levels.index(
+                            default
+                        )
+                        if default
+                        in levels
+                        else 0
+                    )
+
+                    row[col] = (
+                        cat_cols[
+                            i % 2
+                        ].selectbox(
+                            col,
+                            levels,
+                            index=idx,
+                            key=(
+                                f"cat_{col}"
+                            ),
+                        )
+                    )
+
+            submitted = (
+                st.form_submit_button(
+                    "🔮 Predict",
+                    use_container_width=True,
+                )
+            )
+
+        if submitted:
+            input_df = pd.DataFrame(
+                [
+                    [
+                        row[col]
+                        for col
+                        in bundle[
+                            "feature_order"
+                        ]
+                    ]
+                ],
+                columns=bundle[
+                    "feature_order"
+                ],
+            )
+
+            score, threshold, pred = (
+                score_one(
+                    model_name,
+                    input_df,
+                    bundle,
+                )
+            )
+
+            st.session_state[
+                "last_input"
+            ] = input_df
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric(
+                "Model score — Mua",
+                f"{score*100:.2f}%",
+            )
+
+            c2.metric(
+                "Threshold",
+                f"{threshold:.3f}",
+            )
+
+            c3.metric(
+                "Prediction",
+                (
+                    "MUA"
+                    if pred == 1
+                    else "KHÔNG MUA"
+                ),
+            )
+
+            st.progress(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        score,
+                    ),
+                )
+            )
+
+            st.warning(
+                "Model score chưa mặc nhiên "
+                "là calibrated probability."
+            )
+
+
+# ============================================================
+# TAB 5 — EXPLAIN
+# ============================================================
+
 with tabs[4]:
-    st.subheader("Code ↔ Toán ↔ Ý nghĩa")
+    st.header(
+        "5. Explain Prediction"
+    )
 
-    with st.expander("🌳 Decision Tree", expanded=True):
-        st.markdown(r"""
-**Code**
+    bundle = st.session_state[
+        "bundle"
+    ]
+
+    if bundle is None:
+        st.info(
+            "Train model trước."
+        )
+
+    elif "last_input" not in st.session_state:
+        st.info(
+            "Predict một sample trước."
+        )
+
+    else:
+        base, raw_score, contrib = (
+            get_lgbm_contributions(
+                st.session_state[
+                    "last_input"
+                ],
+                bundle,
+            )
+        )
+
+        score = sigmoid(
+            raw_score
+        )
+
+        st.markdown(
+            r"""
+\[
+F(x)
+=
+E[F(x)]
++
+\sum_j \phi_j
+\]
+
+\[
+score
+=
+\sigma(F(x))
+\]
+
+- \(\phi_j>0\): đẩy về Mua.
+- \(\phi_j<0\): đẩy về Không mua.
+"""
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Base raw score",
+            f"{base:.4f}",
+        )
+
+        c2.metric(
+            "Final raw score",
+            f"{raw_score:.4f}",
+        )
+
+        c3.metric(
+            "Sigmoid(raw score)",
+            f"{score*100:.2f}%",
+        )
+
+        top = (
+            contrib.head(10)
+            .copy()
+        )
+
+        top[
+            "direction"
+        ] = np.where(
+            top[
+                "contribution"
+            ] >= 0,
+            "Đẩy về Mua",
+            "Đẩy về Không mua",
+        )
+
+        top = top.sort_values(
+            "contribution"
+        )
+
+        fig = px.bar(
+            top,
+            x="contribution",
+            y="feature",
+            orientation="h",
+            color="direction",
+            title=(
+                "Local feature contribution"
+            ),
+        )
+
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+        )
+
+        st.caption(
+            "Đây là contribution lấy trực tiếp "
+            "từ LightGBM, không phải if/else tự viết."
+        )
+
+
+# ============================================================
+# TAB 6 — CODE ↔ MATH
+# ============================================================
+
+with tabs[5]:
+    st.header(
+        "6. Code ↔ Toán ↔ Ý nghĩa"
+    )
+
+    st.markdown(
+        r"""
+### Decision Tree
+
 ```python
-DecisionTreeClassifier(
-    criterion="gini",
-    max_depth=5,
-    class_weight="balanced"
-)
+criterion="gini"
+max_depth=5
 ```
 
-**Toán**
-
-Với binary classification:
-
 \[
-Gini(S)=1-p_0^2-p_1^2
+Gini(S)
+=
+1-\sum_k p_k^2
 \]
 
-Một split tốt làm impurity sau khi chia giảm nhiều.
+---
 
-**Mapping**
+### Bagging
 
-- `criterion="gini"` ↔ dùng Gini impurity.
-- `max_depth=5` ↔ giới hạn độ phức tạp cây.
-- `class_weight="balanced"` ↔ lỗi của lớp thiểu số được tăng trọng số.
-""")
-
-    with st.expander("👜 Bagging"):
-        st.markdown(r"""
-**Code**
 ```python
-BaggingClassifier(
-    estimator=base_tree,
-    n_estimators=120,
-    bootstrap=True
-)
+bootstrap=True
+n_estimators=120
 ```
 
-**Toán / thuật toán**
-
-Tạo \(B\) bootstrap datasets:
-
 \[
-D_1,\dots,D_B \sim Bootstrap(D)
+D_b
+\sim
+Bootstrap(D)
 \]
 
-train \(B\) cây:
-
 \[
-h_1,\dots,h_B
-\]
-
-và phân lớp bằng majority vote:
-
-\[
-\hat y = mode(h_1(x),...,h_B(x))
-\]
-
-**Ý nghĩa**
-
-Các cây được train gần như độc lập → trung bình/vote giúp giảm variance.
-""")
-
-    with st.expander("🌲 Random Forest"):
-        st.markdown(r"""
-**Code**
-```python
-RandomForestClassifier(
-    n_estimators=250,
-    bootstrap=True,
-    max_features="sqrt"
+\hat y
+=
+mode(
+h_1(x),...,h_B(x)
 )
+\]
+
+---
+
+### Random Forest
+
+```python
+max_features="sqrt"
 ```
 
-**Ý tưởng**
+\[
+m
+\approx
+\sqrt{p}
+\]
 
 Random Forest = Bagging + random feature subset.
 
-Nếu có \(p\) feature, `"sqrt"` thường cân nhắc xấp xỉ:
+---
 
-\[
-m \approx \sqrt{p}
-\]
+### LightGBM
 
-feature tại mỗi split.
-
-**Ý nghĩa**
-
-Giảm tương quan giữa các cây → ensemble thường ổn định hơn Bagging cây thuần.
-""")
-
-    with st.expander("🚀 LightGBM / Gradient Boosting"):
-        st.markdown(
-            rf"""
-**Code đang train**
 ```python
-LGBMClassifier(
-    objective="binary",
-    learning_rate=0.03,
-    n_estimators=500,
-    max_depth=5,
-    num_leaves=25,
-    scale_pos_weight={bundle["scale_pos_weight"]:.4f},
-    reg_lambda=1.0
-)
+learning_rate=0.03
+reg_lambda=1.0
+scale_pos_weight=...
 ```
 
-### 1. Boosting update
+Boosting:
 
 \[
-F_m(x)=F_{{m-1}}(x)+\eta f_m(x)
-\]
-
-Mapping:
-
-- `learning_rate=0.03` ↔ \(\eta=0.03\)
-- `n_estimators` ↔ số boosting rounds tối đa.
-- early stopping ↔ chọn số round dựa trên Validation.
-
-### 2. Binary log-loss
-
-\[
-L_i
+F_m(x)
 =
--w_i
-\left[
-y_i\log p_i + (1-y_i)\log(1-p_i)
-\right]
-\]
-
-\[
-p_i=\sigma(F(x_i))
-\]
-
-Trong model này:
-
-\[
-w_i=
-\begin{{cases}}
-{bundle["scale_pos_weight"]:.4f}, & y_i=1\\
-1, & y_i=0
-\end{{cases}}
-\]
-
-`scale_pos_weight` là **class weight**, KHÔNG phải \(\lambda\).
-
-### 3. Regularization
-
-`reg_lambda=1.0` mới tương ứng với L2 regularization trên leaf weights.
-
-### 4. Gradient + Hessian
-
-LightGBM dùng thông tin đạo hàm bậc một \(g_i\) và bậc hai \(h_i\)
-để đánh giá split / leaf update.
-
-Một dạng lõi của split gain:
-
-\[
-Gain
-\approx
-\frac12
-\left[
-\frac{{G_L^2}}{{H_L+\lambda}}
+F_{m-1}(x)
 +
-\frac{{G_R^2}}{{H_R+\lambda}}
--
-\frac{{G^2}}{{H+\lambda}}
-\right]
+\eta f_m(x)
 \]
 
 với:
 
 \[
-G=\sum_i g_i,\qquad H=\sum_i h_i
+\eta=0.03
 \]
 
-Đây là công thức cốt lõi để hiểu; implementation thực tế còn có thêm
-các constraint/hyperparameter khác.
+Binary loss:
+
+\[
+L_i
+=
+-w_i
+[
+y_i\log p_i
++
+(1-y_i)\log(1-p_i)
+]
+\]
+
+`scale_pos_weight` là class weighting.
+
+`reg_lambda` mới là L2 regularization:
+
+\[
+\lambda
+\]
 """
+    )
+
+
+# ============================================================
+# TAB 7 — GITHUB
+# ============================================================
+
+with tabs[6]:
+    st.header(
+        "7. GitHub Auto Update"
+    )
+
+    st.markdown(
+        f"""
+Repo mặc định:
+
+```text
+{DEFAULT_GITHUB_REPO}
+```
+
+Branch:
+
+```text
+{DEFAULT_GITHUB_BRANCH}
+```
+
+Sau khi bấm:
+
+```text
+🚀 Train + cập nhật GitHub
+```
+
+app sẽ tự cập nhật:
+
+```text
+{MODEL_PATH_IN_REPO}
+```
+
+và:
+
+```text
+{METRICS_PATH_IN_REPO}
+```
+"""
+    )
+
+    st.markdown(
+        """
+### Streamlit Secrets
+
+Trong **Streamlit Cloud → App → Settings → Secrets**:
+
+```toml
+GITHUB_TOKEN = "YOUR_NEW_TOKEN"
+GITHUB_REPO = "phatpt1/math4ai"
+GITHUB_BRANCH = "main"
+```
+
+Không lưu token trực tiếp trong `app.py`.
+"""
+    )
+
+    st.warning(
+        "Token GitHub đã từng được dán trực tiếp vào chat/source "
+        "nên nên revoke token cũ và tạo token mới. "
+        "Token mới chỉ cần Contents: Read and write cho đúng repo."
+    )
+
+    if st.session_state["bundle"] is not None:
+        st.subheader(
+            "Thông tin model hiện tại"
         )
 
-    st.markdown("### Bảng mapping nhanh")
-    mapping = pd.DataFrame([
-        ["criterion='gini'", r"$1-\sum_k p_k^2$", "Độ không thuần của node"],
-        ["bootstrap=True", r"$D_b\sim Bootstrap(D)$", "Lấy mẫu có hoàn lại"],
-        ["n_estimators=B", r"$h_1,\ldots,h_B$", "Số cây / learners"],
-        ["max_features='sqrt'", r"$m\approx\sqrt p$", "Random subset feature ở Forest"],
-        ["learning_rate=η", r"$F_m=F_{m-1}+\eta f_m$", "Độ lớn correction của mỗi cây boosting"],
-        ["scale_pos_weight", r"$w_{y=1}>w_{y=0}$", "Tăng trọng số lớp Mua"],
-        ["reg_lambda", r"$\lambda$", "L2 regularization của LightGBM"],
-        ["predict_proba", r"$\sigma(F(x))$", "Model output score trên [0,1]"],
-    ], columns=["Code", "Toán", "Ý nghĩa"])
-    st.dataframe(mapping, use_container_width=True, hide_index=True)
-
-
-# ==========================================================
-# TAB 6
-# ==========================================================
-with tabs[5]:
-    st.subheader("Audit Notes — những lỗi bản cũ đã được sửa")
-
-    st.markdown("""
-1. **Không stringify categorical trước khi predict.**  
-   `2` không được biến thành `"2"`, `True` không thành `"True"`.
-
-2. **Không bịa feature ẩn.**  
-   Không còn `ExitRates = BounceRates + 0.01`. Simple Demo dùng median/mode của **train** và nói rõ điều đó.
-
-3. **Không giả lập reasoning bằng if/else.**  
-   Local explanation được lấy trực tiếp từ LightGBM contribution.
-
-4. **Không gọi `scale_pos_weight` là lambda.**  
-   Class weighting và L2 regularization là hai khái niệm khác nhau.
-
-5. **Không gọi split importance là “mức độ tác động”.**  
-   App tách rõ Gain importance và Split importance.
-
-6. **Không tune threshold trên Test.**  
-   Validation chọn threshold; Test chỉ báo cáo cuối cùng.
-
-7. **Không khẳng định raw model score là xác suất thực tế đã calibration.**
-
-8. **Giữ cảnh báo về `PageValues`.**  
-   Phải xác định feature này có tồn tại tại thời điểm business muốn dự đoán hay không.
-""")
-
-    st.markdown("### Checklist trước khi bảo vệ")
-    checks = [
-        "Tôi giải thích được vì sao dữ liệu mất cân bằng.",
-        "Tôi giải thích được Tree → Bagging → Random Forest → Boosting.",
-        "Tôi map được từng hyperparameter chính sang thuật toán/toán.",
-        "Tôi phân biệt Gain importance với local contribution.",
-        "Tôi không dùng Test để chọn model parameter/threshold.",
-        "Tôi biết tại sao PageValues cần kiểm tra leakage / prediction timing.",
-        "Tôi không gọi model score là calibrated probability khi chưa kiểm chứng.",
-    ]
-    for x in checks:
-        st.checkbox(x, value=False)
+        st.json(
+            {
+                "trained_at_utc": st.session_state[
+                    "bundle"
+                ].get(
+                    "trained_at_utc"
+                ),
+                "recommended_model": st.session_state[
+                    "bundle"
+                ][
+                    "recommended_model"
+                ],
+                "repo_model_path": MODEL_PATH_IN_REPO,
+                "repo_metrics_path": METRICS_PATH_IN_REPO,
+            }
+        )
