@@ -1,4 +1,6 @@
 import streamlit as st
+import numpy as np
+import matplotlib.pyplot as plt
 
 st.set_page_config(
     page_title="CS115 - Math for Computer Science Review",
@@ -35,6 +37,10 @@ topics = [
     "Neural Network",
     "Backpropagation",
     "Tóm tắt công thức",
+    "Quiz trắc nghiệm",
+    "Bài tập có đáp án",
+    "Visualization: Linear Regression",
+    "Visualization: Gradient Descent",
 ]
 
 with st.sidebar:
@@ -396,5 +402,477 @@ elif topic == "Tóm tắt công thức":
     formula("Activation", r"\mathbf{h}=\phi(\mathbf{z})")
     formula("2-layer", r"\mathbf{s}=W_2\phi(W_1\mathbf{x}+b_1)+b_2")
 
+
+elif topic == "Quiz trắc nghiệm":
+    st.header("🧠 Quiz trắc nghiệm CS115")
+    st.caption("20 câu hỏi tổng hợp: Đại số tuyến tính, xác suất, giải tích, ML, tối ưu và Neural Network.")
+
+    quiz = [
+        {
+            "q": "1. Điều kiện để hai vector x và y trực giao là gì?",
+            "options": ["x + y = 0", "xᵀy = 0", "||x|| = ||y||", "x = y"],
+            "answer": 1,
+            "explain": "Hai vector trực giao khi inner product của chúng bằng 0."
+        },
+        {
+            "q": "2. Gradient của hàm nhiều biến biểu diễn điều gì?",
+            "options": [
+                "Hướng giảm nhanh nhất",
+                "Hướng tăng nhanh nhất của hàm tại điểm đang xét",
+                "Giá trị nhỏ nhất của hàm",
+                "Ma trận nghịch đảo"
+            ],
+            "answer": 1,
+            "explain": "Gradient chỉ hướng tăng nhanh nhất; negative gradient chỉ hướng giảm nhanh nhất cục bộ."
+        },
+        {
+            "q": "3. Công thức cập nhật Gradient Descent là?",
+            "options": [
+                "θ ← θ + η∇L",
+                "θ ← θ − η∇L",
+                "θ ← η/∇L",
+                "θ ← ∇L − θ"
+            ],
+            "answer": 1,
+            "explain": "Ta đi ngược hướng gradient để giảm loss."
+        },
+        {
+            "q": "4. Trong Linear Regression nhiều biến, mô hình có dạng nào?",
+            "options": [
+                "ŷ = b + wᵀx",
+                "ŷ = wx²",
+                "ŷ = softmax(x)",
+                "ŷ = ||x||"
+            ],
+            "answer": 0,
+            "explain": "Mô hình tuyến tính đa biến có dạng b + wᵀx."
+        },
+        {
+            "q": "5. Overfitting là hiện tượng nào?",
+            "options": [
+                "Train error cao, test error thấp",
+                "Train và test đều tốt",
+                "Train rất tốt nhưng test kém",
+                "Mô hình không có tham số"
+            ],
+            "answer": 2,
+            "explain": "Overfitting xảy ra khi mô hình học quá sát dữ liệu train và tổng quát hóa kém."
+        },
+        {
+            "q": "6. Phân phối Binomial mô tả gì?",
+            "options": [
+                "Số lần thành công trong n phép thử Bernoulli độc lập",
+                "Khoảng cách giữa hai vector",
+                "Đạo hàm của loss",
+                "Số lớp của neural network"
+            ],
+            "answer": 0,
+            "explain": "X ~ B(n,p) đếm số lần biến cố thành công xảy ra trong n phép thử."
+        },
+        {
+            "q": "7. Kỳ vọng của X ~ B(n,p) là?",
+            "options": ["p", "np", "n/p", "np(1-p)"],
+            "answer": 1,
+            "explain": "E[X] = np."
+        },
+        {
+            "q": "8. Phương sai của X ~ B(n,p) là?",
+            "options": ["np", "n²p", "np(1-p)", "p(1-p)"],
+            "answer": 2,
+            "explain": "Var(X) = np(1-p)."
+        },
+        {
+            "q": "9. Backpropagation chủ yếu dựa trên quy tắc nào?",
+            "options": ["Bayes rule", "Chain rule", "Cramer rule", "Cosine rule"],
+            "answer": 1,
+            "explain": "Backprop là ứng dụng đệ quy của chain rule trên computational graph."
+        },
+        {
+            "q": "10. Vai trò chính của backpropagation là gì?",
+            "options": [
+                "Tự động cập nhật weight",
+                "Tính gradient của loss theo các tham số",
+                "Chia train/test",
+                "Chuẩn hóa dữ liệu"
+            ],
+            "answer": 1,
+            "explain": "Backprop tính gradient; optimizer mới dùng gradient để cập nhật weight."
+        },
+        {
+            "q": "11. Batch Gradient Descent dùng bao nhiêu dữ liệu cho mỗi lần tính gradient?",
+            "options": ["1 mẫu", "Một mini-batch", "Toàn bộ tập train", "Không dùng dữ liệu"],
+            "answer": 2,
+            "explain": "Batch GD tính gradient dựa trên toàn bộ tập huấn luyện."
+        },
+        {
+            "q": "12. SGD theo định nghĩa cơ bản dùng?",
+            "options": ["Một mẫu mỗi update", "Toàn bộ dữ liệu", "Chỉ validation set", "Không tính gradient"],
+            "answer": 0,
+            "explain": "Stochastic Gradient Descent cập nhật tham số dựa trên từng mẫu."
+        },
+        {
+            "q": "13. Projection của v lên u có hệ số nào?",
+            "options": [
+                "(uᵀv)/(uᵀu)",
+                "(uᵀu)/(uᵀv)",
+                "||u+v||",
+                "det(u)"
+            ],
+            "answer": 0,
+            "explain": "proj_u(v) = ((uᵀv)/(uᵀu))u."
+        },
+        {
+            "q": "14. Tập vector độc lập tuyến tính khi nào?",
+            "options": [
+                "Có ít nhất một vector 0",
+                "Tổ hợp tuyến tính bằng 0 chỉ có nghiệm hệ số bằng 0",
+                "Tất cả vector cùng phương",
+                "Mọi vector có norm bằng 1"
+            ],
+            "answer": 1,
+            "explain": "Đó là định nghĩa cơ bản của độc lập tuyến tính."
+        },
+        {
+            "q": "15. L2 regularization thêm đại lượng nào vào loss?",
+            "options": ["λ||w||²", "λ||w||₁", "λ/w", "λ det(W)"],
+            "answer": 0,
+            "explain": "L2 sử dụng bình phương norm Euclidean của vector trọng số."
+        },
+        {
+            "q": "16. Neural Network khác Linear Classifier cơ bản ở điểm chính nào?",
+            "options": [
+                "Không có tham số",
+                "Có hidden layer và phép biến đổi phi tuyến",
+                "Không cần dữ liệu",
+                "Không dùng gradient"
+            ],
+            "answer": 1,
+            "explain": "Hidden layer + activation giúp mạng biểu diễn quan hệ phi tuyến."
+        },
+        {
+            "q": "17. Newton's method sử dụng thêm thông tin nào so với Gradient Descent?",
+            "options": ["Hessian / đạo hàm bậc hai", "Chỉ xác suất", "Chỉ norm L1", "Chỉ bias"],
+            "answer": 0,
+            "explain": "Newton sử dụng Hessian để khai thác curvature của hàm."
+        },
+        {
+            "q": "18. Một orthonormal basis phải thỏa?",
+            "options": [
+                "Các vector cùng phương",
+                "Các vector trực giao đôi một và norm bằng 1",
+                "Tổng vector bằng 0",
+                "Ma trận basis có det bằng 0"
+            ],
+            "answer": 1,
+            "explain": "Orthonormal = orthogonal + normalized."
+        },
+        {
+            "q": "19. Numerical gradient có đặc điểm nào?",
+            "options": [
+                "Nhanh và exact",
+                "Chậm, xấp xỉ nhưng dễ cài đặt",
+                "Không thể dùng để kiểm tra code",
+                "Không cần loss"
+            ],
+            "answer": 1,
+            "explain": "Numerical gradient thường được dùng để gradient-check analytic gradient."
+        },
+        {
+            "q": "20. 'No Free Lunch' trong ML nhấn mạnh điều gì?",
+            "options": [
+                "Luôn dùng neural network",
+                "Luôn dùng linear regression",
+                "Không có mô hình tốt nhất cho mọi bài toán",
+                "Mọi mô hình đều cho kết quả giống nhau"
+            ],
+            "answer": 2,
+            "explain": "Không có một mô hình duy nhất tối ưu trên mọi loại bài toán."
+        },
+    ]
+
+    if "quiz_submitted" not in st.session_state:
+        st.session_state.quiz_submitted = False
+
+    with st.form("cs115_quiz"):
+        responses = []
+        for i, item in enumerate(quiz):
+            choice = st.radio(
+                item["q"],
+                item["options"],
+                index=None,
+                key=f"quiz_{i}",
+            )
+            responses.append(choice)
+        submitted = st.form_submit_button("Chấm điểm", use_container_width=True)
+
+    if submitted:
+        st.session_state.quiz_submitted = True
+        score = 0
+        unanswered = 0
+        for i, item in enumerate(quiz):
+            selected = st.session_state.get(f"quiz_{i}")
+            if selected is None:
+                unanswered += 1
+            elif selected == item["options"][item["answer"]]:
+                score += 1
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Điểm", f"{score}/{len(quiz)}")
+        c2.metric("Tỷ lệ đúng", f"{score/len(quiz)*100:.0f}%")
+        c3.metric("Chưa trả lời", unanswered)
+
+        if score >= 17:
+            st.success("Rất tốt — nền tảng khá chắc.")
+        elif score >= 13:
+            st.info("Khá tốt — nên xem lại các câu sai.")
+        else:
+            st.warning("Nên ôn lại phần công thức và các khái niệm nền tảng.")
+
+        with st.expander("Xem đáp án và giải thích", expanded=True):
+            for i, item in enumerate(quiz):
+                selected = st.session_state.get(f"quiz_{i}")
+                correct = item["options"][item["answer"]]
+                if selected == correct:
+                    st.markdown(f"**Câu {i+1}: ✅ Đúng** — {correct}")
+                else:
+                    shown = selected if selected is not None else "Chưa trả lời"
+                    st.markdown(f"**Câu {i+1}: ❌ {shown}**  \nĐáp án: **{correct}**")
+                st.caption(item["explain"])
+                st.divider()
+
+elif topic == "Bài tập có đáp án":
+    st.header("✍️ Bài tập có đáp án")
+    st.caption("Bài tập ngắn bám theo các nhóm kiến thức chính trong bộ tài liệu.")
+
+    exercises = [
+        (
+            "Đại số tuyến tính — Dot product",
+            "Cho x = (1, 2, -1), y = (2, 0, 3). Tính xᵀy và cho biết hai vector có trực giao không.",
+            r"x^Ty = 1\cdot2 + 2\cdot0 + (-1)\cdot3 = -1.",
+            "Vì xᵀy = -1 ≠ 0 nên hai vector không trực giao."
+        ),
+        (
+            "Hình học giải tích — Norm và khoảng cách",
+            "Cho x = (3,4), y = (0,0). Tính ||x||₂ và d(x,y).",
+            r"\|x\|_2=\sqrt{3^2+4^2}=5,\qquad d(x,y)=\|x-y\|_2=5.",
+            "Khi y là vector 0, khoảng cách từ x tới y chính là norm của x."
+        ),
+        (
+            "Projection",
+            "Cho v = (3,4), u = (1,0). Tính projection của v lên u.",
+            r"\mathrm{proj}_u(v)=\frac{u^Tv}{u^Tu}u=\frac{3}{1}(1,0)=(3,0).",
+            "Projection giữ lại thành phần của v theo hướng u."
+        ),
+        (
+            "Xác suất — Binomial",
+            "Một phép thử có xác suất thành công p=0.6. Thực hiện n=5 lần độc lập. Tính P(X=3).",
+            r"P(X=3)=\binom53(0.6)^3(0.4)^2=10\times0.216\times0.16=0.3456.",
+            "Đây là công thức phân phối nhị thức."
+        ),
+        (
+            "Giải tích — Gradient",
+            "Cho f(x,y)=x²+3y². Tính gradient tại (2,-1).",
+            r"\nabla f=(2x,6y)\Rightarrow \nabla f(2,-1)=(4,-6).",
+            "Negative gradient (-4,6) là hướng giảm nhanh nhất cục bộ."
+        ),
+        (
+            "Linear Regression — Dự đoán",
+            "Cho mô hình ŷ = b + wx với b=1.5, w=2 và x=3. Tính ŷ.",
+            r"\hat y=1.5+2\cdot3=7.5.",
+            "Đây là forward prediction của hồi quy tuyến tính 1 biến."
+        ),
+        (
+            "Squared Error",
+            "Nếu y=10 và ŷ=7.5, tính 1/2(y-ŷ)².",
+            r"J=\frac12(10-7.5)^2=\frac12(2.5)^2=3.125.",
+            "Hệ số 1/2 thường giúp đạo hàm gọn hơn."
+        ),
+        (
+            "Gradient Descent",
+            "Cho θ=5, gradient = 4, learning rate η=0.1. Tính θ mới.",
+            r"\theta_{new}=5-0.1\cdot4=4.6.",
+            "Gradient dương nên cập nhật theo hướng giảm làm θ nhỏ đi."
+        ),
+        (
+            "L2 Regularization",
+            "Cho w=(3,4), λ=0.1. Phần phạt L2 λ||w||² bằng bao nhiêu?",
+            r"\lambda\|w\|_2^2=0.1(3^2+4^2)=0.1(25)=2.5.",
+            "L2 phạt các trọng số lớn."
+        ),
+        (
+            "Backpropagation — Chain rule",
+            "Cho y=u² và u=3x. Tính dy/dx tại x=2.",
+            r"\frac{dy}{dx}=\frac{dy}{du}\frac{du}{dx}=2u\cdot3=6u.",
+            "Tại x=2 ⇒ u=6 ⇒ dy/dx=36."
+        ),
+    ]
+
+    for idx, (title, question, solution, note) in enumerate(exercises, start=1):
+        st.subheader(f"Bài {idx}. {title}")
+        st.markdown(question)
+        with st.expander("Hiện đáp án"):
+            st.latex(solution)
+            st.info(note)
+
+elif topic == "Visualization: Linear Regression":
+    st.header("📈 Visualization — Linear Regression")
+    st.caption("Tạo dữ liệu giả, fit đường thẳng bằng Gradient Descent và quan sát ảnh hưởng của noise/learning rate.")
+
+    c1, c2, c3, c4 = st.columns(4)
+    n = c1.slider("Số điểm dữ liệu", 20, 300, 80, 10)
+    noise = c2.slider("Noise", 0.0, 10.0, 2.0, 0.5)
+    lr = c3.select_slider("Learning rate", options=[0.001, 0.003, 0.01, 0.03, 0.05, 0.1], value=0.03)
+    epochs = c4.slider("Epochs", 10, 500, 120, 10)
+
+    true_w = st.slider("True slope w", -5.0, 5.0, 2.5, 0.1)
+    true_b = st.slider("True bias b", -10.0, 10.0, 1.0, 0.5)
+    seed = st.number_input("Random seed", value=42, step=1)
+
+    rng = np.random.default_rng(int(seed))
+    X = rng.uniform(-5, 5, int(n))
+    y = true_w * X + true_b + rng.normal(0, noise, int(n))
+
+    # Standardize X for stable GD while keeping predictions interpretable
+    x_mean = X.mean()
+    x_std = X.std() if X.std() > 1e-12 else 1.0
+    Xs = (X - x_mean) / x_std
+
+    w, b = 0.0, 0.0
+    costs = []
+    for _ in range(int(epochs)):
+        y_hat = w * Xs + b
+        err = y_hat - y
+        cost = np.mean(err ** 2) / 2
+        costs.append(cost)
+        dw = np.mean(err * Xs)
+        db = np.mean(err)
+        w -= lr * dw
+        b -= lr * db
+
+    # convert standardized-space parameters back to original x-space
+    fitted_w = w / x_std
+    fitted_b = b - (w * x_mean / x_std)
+
+    x_line = np.linspace(X.min(), X.max(), 200)
+    y_line = fitted_w * x_line + fitted_b
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.scatter(X, y, alpha=0.7, label="Data")
+    ax.plot(x_line, y_line, linewidth=2, label="Fitted line")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_title("Linear Regression fitted by Gradient Descent")
+    ax.legend()
+    ax.grid(alpha=0.2)
+    st.pyplot(fig, clear_figure=True)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Estimated w", f"{fitted_w:.4f}", delta=f"{fitted_w-true_w:+.4f}")
+    m2.metric("Estimated b", f"{fitted_b:.4f}", delta=f"{fitted_b-true_b:+.4f}")
+    m3.metric("Final cost", f"{costs[-1]:.6f}")
+
+    fig2, ax2 = plt.subplots(figsize=(8, 3.8))
+    ax2.plot(range(1, len(costs) + 1), costs)
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Cost")
+    ax2.set_title("Cost over epochs")
+    ax2.grid(alpha=0.2)
+    st.pyplot(fig2, clear_figure=True)
+
+    with st.expander("Giải thích thuật toán"):
+        st.latex(r"\hat y_i = wx_i+b")
+        st.latex(r"J(w,b)=\frac{1}{2N}\sum_{i=1}^{N}(\hat y_i-y_i)^2")
+        st.latex(r"w\leftarrow w-\eta\frac{\partial J}{\partial w},\qquad b\leftarrow b-\eta\frac{\partial J}{\partial b}")
+        st.markdown("""
+- **Noise tăng** → dữ liệu khó fit hơn.
+- **Learning rate quá nhỏ** → hội tụ chậm.
+- **Learning rate quá lớn** → có thể dao động hoặc phân kỳ.
+- **Epoch tăng** → có thêm bước cập nhật để tối ưu cost.
+""")
+
+elif topic == "Visualization: Gradient Descent":
+    st.header("⛰️ Visualization — Gradient Descent")
+    st.caption("Quan sát cách Gradient Descent tìm cực tiểu của một hàm bậc hai 1 chiều.")
+
+    st.latex(r"f(x)=a(x-c)^2+d")
+
+    c1, c2, c3 = st.columns(3)
+    a = c1.slider("a (>0)", 0.1, 5.0, 1.0, 0.1)
+    c = c2.slider("Vị trí cực tiểu c", -5.0, 5.0, 1.0, 0.1)
+    d = c3.slider("Giá trị dịch d", -5.0, 5.0, 0.0, 0.5)
+
+    c4, c5, c6 = st.columns(3)
+    x0 = c4.slider("Điểm bắt đầu x₀", -10.0, 10.0, -7.0, 0.5)
+    eta = c5.select_slider("Learning rate η", options=[0.01, 0.03, 0.05, 0.1, 0.2, 0.4, 0.8], value=0.1)
+    steps = c6.slider("Số bước", 1, 50, 12)
+
+    def f(x):
+        return a * (x - c) ** 2 + d
+
+    def grad(x):
+        return 2 * a * (x - c)
+
+    xs = [float(x0)]
+    for _ in range(int(steps)):
+        x_new = xs[-1] - eta * grad(xs[-1])
+        if not np.isfinite(x_new) or abs(x_new) > 1e6:
+            break
+        xs.append(float(x_new))
+
+    plot_min = min(-10, min(xs) - 1, c - 5)
+    plot_max = max(10, max(xs) + 1, c + 5)
+    xgrid = np.linspace(plot_min, plot_max, 500)
+
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    ax.plot(xgrid, f(xgrid), label="f(x)")
+    ax.scatter(xs, [f(x) for x in xs], zorder=3, label="GD steps")
+    for i in range(len(xs) - 1):
+        ax.annotate(
+            "",
+            xy=(xs[i + 1], f(xs[i + 1])),
+            xytext=(xs[i], f(xs[i])),
+            arrowprops=dict(arrowstyle="->", alpha=0.55),
+        )
+    ax.axvline(c, linestyle="--", alpha=0.7, label="Minimum x=c")
+    ax.set_xlabel("x")
+    ax.set_ylabel("f(x)")
+    ax.set_title("Gradient Descent trajectory")
+    ax.legend()
+    ax.grid(alpha=0.2)
+    st.pyplot(fig, clear_figure=True)
+
+    final_x = xs[-1]
+    mc1, mc2, mc3 = st.columns(3)
+    mc1.metric("x cuối", f"{final_x:.6f}")
+    mc2.metric("|x − c|", f"{abs(final_x-c):.6f}")
+    mc3.metric("f(x cuối)", f"{f(final_x):.6f}")
+
+    st.markdown("#### Bảng các bước cập nhật")
+    rows = []
+    for i, xval in enumerate(xs):
+        rows.append({
+            "step": i,
+            "x": round(xval, 6),
+            "f(x)": round(float(f(xval)), 6),
+            "gradient": round(float(grad(xval)), 6),
+        })
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    if eta * 2 * a >= 2:
+        st.warning(
+            "Learning rate đang lớn đối với hàm này; Gradient Descent có thể dao động hoặc phân kỳ."
+        )
+    else:
+        st.success("Thiết lập hiện tại nằm trong vùng thường hội tụ cho hàm bậc hai này.")
+
+    with st.expander("Công thức"):
+        st.latex(r"f'(x)=2a(x-c)")
+        st.latex(r"x_{t+1}=x_t-\eta\,2a(x_t-c)")
+        st.markdown("""
+Nếu \(a>0\), cực tiểu thật nằm tại \(x=c\).  
+Mục tiêu của Gradient Descent là khiến \(x_t\) tiến dần tới \(c\).
+""")
+
 st.divider()
-st.caption("CS115 Review App — tổng hợp ngắn gọn để học và tra cứu trên Streamlit.")
+st.caption("CS115 Review App — lý thuyết + quiz + bài tập + visualization.")
+
