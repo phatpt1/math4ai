@@ -331,14 +331,24 @@ def get_defaults(X_train):
 # ============================================================
 
 def train_everything(df, category_levels):
+    """
+    Train 4 models trên cùng một split.
+
+    Quy tắc khoa học của project:
+    - TRAIN: học tham số model.
+    - VALIDATION: chọn threshold + chọn model thắng cuộc.
+    - TEST: chỉ dùng báo cáo cuối, KHÔNG dùng để chọn model.
+
+    Model được chọn theo VALIDATION PR-AUC. Nếu bằng nhau, dùng F1 rồi
+    Recall làm tie-breaker.
+    """
     X_train, X_val, X_test, y_train, y_val, y_test = split_data(df)
 
     models = {}
-    results = {}
+    validation_results = {}
+    test_results = {}
 
-    # -------------------------
-    # Decision Tree
-    # -------------------------
+    # 1) Decision Tree
     tree = Pipeline(
         [
             ("prep", build_preprocessor()),
@@ -355,9 +365,7 @@ def train_everything(df, category_levels):
         ]
     )
 
-    # -------------------------
-    # Bagging
-    # -------------------------
+    # 2) Bagging
     base_tree = DecisionTreeClassifier(
         criterion="gini",
         max_depth=5,
@@ -365,7 +373,6 @@ def train_everything(df, category_levels):
         class_weight="balanced",
         random_state=RANDOM_STATE,
     )
-
     bagging = Pipeline(
         [
             ("prep", build_preprocessor()),
@@ -373,9 +380,7 @@ def train_everything(df, category_levels):
         ]
     )
 
-    # -------------------------
-    # Random Forest
-    # -------------------------
+    # 3) Random Forest
     forest = Pipeline(
         [
             ("prep", build_preprocessor()),
@@ -404,22 +409,17 @@ def train_everything(df, category_levels):
     for name, model in sklearn_models.items():
         model.fit(X_train, y_train)
 
+        # VALIDATION: chọn threshold + dùng để xếp hạng model
         val_prob = model.predict_proba(X_val)[:, 1]
         threshold = choose_threshold(y_val, val_prob)
+        validation_results[name] = evaluate_model(y_val, val_prob, threshold)
 
+        # TEST: chỉ báo cáo với threshold đã khóa từ validation
         test_prob = model.predict_proba(X_test)[:, 1]
-
-        results[name] = evaluate_model(
-            y_test,
-            test_prob,
-            threshold,
-        )
-
+        test_results[name] = evaluate_model(y_test, test_prob, threshold)
         models[name] = model
 
-    # -------------------------
-    # LightGBM
-    # -------------------------
+    # 4) LightGBM / Gradient Boosting
     negative = int((y_train == 0).sum())
     positive = int((y_train == 1).sum())
     scale_pos_weight = negative / positive
@@ -448,42 +448,22 @@ def train_everything(df, category_levels):
         categorical_feature=CATEGORICAL_FEATURES,
         eval_set=[(X_val, y_val)],
         eval_metric="binary_logloss",
-        callbacks=[
-            lgb.early_stopping(
-                40,
-                verbose=False,
-            )
-        ],
+        callbacks=[lgb.early_stopping(40, verbose=False)],
     )
 
     val_prob = lgbm.predict_proba(X_val)[:, 1]
     threshold = choose_threshold(y_val, val_prob)
+    validation_results["LightGBM"] = evaluate_model(y_val, val_prob, threshold)
 
     test_prob = lgbm.predict_proba(X_test)[:, 1]
-
-    results["LightGBM"] = evaluate_model(
-        y_test,
-        test_prob,
-        threshold,
-    )
-
+    test_results["LightGBM"] = evaluate_model(y_test, test_prob, threshold)
     models["LightGBM"] = lgbm
 
-    # -------------------------
-    # LightGBM feature importance
-    # -------------------------
-    gain = lgbm.booster_.feature_importance(
-        importance_type="gain"
-    )
-
-    split = lgbm.booster_.feature_importance(
-        importance_type="split"
-    )
-
+    # LightGBM global importance: chỉ để chẩn đoán, không dùng chọn model
+    gain = lgbm.booster_.feature_importance(importance_type="gain")
+    split = lgbm.booster_.feature_importance(importance_type="split")
     names = lgbm.booster_.feature_name()
-
     gain_total = float(np.sum(gain)) or 1.0
-
     importance = pd.DataFrame(
         {
             "feature": names,
@@ -493,18 +473,27 @@ def train_everything(df, category_levels):
         }
     ).sort_values("gain", ascending=False)
 
+    # Chọn model bằng VALIDATION, tuyệt đối không dùng TEST để chọn
     ranking = sorted(
-        results.items(),
-        key=lambda kv: kv[1]["pr_auc"],
+        validation_results.items(),
+        key=lambda kv: (
+            kv[1]["pr_auc"],
+            kv[1]["f1"],
+            kv[1]["recall"],
+        ),
         reverse=True,
     )
-
     recommended_model = ranking[0][0]
 
     bundle = {
         "models": models,
-        "metrics": results,
+        "metrics": test_results,  # TEST metrics
+        "validation_metrics": validation_results,
         "recommended_model": recommended_model,
+        "selection_rule": (
+            "Chọn model theo Validation PR-AUC; "
+            "nếu bằng nhau dùng F1 rồi Recall."
+        ),
         "feature_order": list(X_train.columns),
         "numeric_features": NUMERIC_FEATURES,
         "categorical_features": CATEGORICAL_FEATURES,
@@ -521,18 +510,12 @@ def train_everything(df, category_levels):
             "test": int(len(X_test)),
         },
         "scale_pos_weight": float(scale_pos_weight),
-        "lgbm_best_iteration": int(
-            lgbm.best_iteration_
-            or lgbm.n_estimators
-        ),
+        "lgbm_best_iteration": int(lgbm.best_iteration_ or lgbm.n_estimators),
         "lgbm_feature_importance": importance,
-        "trained_at_utc": datetime.now(
-            timezone.utc
-        ).isoformat(),
+        "trained_at_utc": datetime.now(timezone.utc).isoformat(),
     }
 
     return bundle
-
 
 # ============================================================
 # 3. PREDICTION + EXPLAINABILITY
@@ -628,6 +611,28 @@ def get_lgbm_contributions(row_df, bundle):
     return base, raw_score, contrib_df
 
 
+def get_what_if_sensitivity(model_name, row_df, bundle):
+    """Model-agnostic local what-if explanation for all 4 models."""
+    base_score, threshold, pred = score_one(model_name, row_df, bundle)
+    rows = []
+    for col in bundle["feature_order"]:
+        changed = row_df.copy()
+        changed.loc[changed.index[0], col] = bundle["defaults"][col]
+        changed_score, _, _ = score_one(model_name, changed, bundle)
+        delta = float(base_score - changed_score)
+        rows.append({
+            "feature": col,
+            "current_value": row_df.iloc[0][col],
+            "baseline_value": bundle["defaults"][col],
+            "score_delta": delta,
+            "abs_delta": abs(delta),
+        })
+    return (
+        base_score, threshold, pred,
+        pd.DataFrame(rows).sort_values("abs_delta", ascending=False),
+    )
+
+
 # ============================================================
 # 4. SERIALIZATION
 # ============================================================
@@ -661,6 +666,12 @@ def make_metrics_json(bundle) -> str:
         ),
         "metrics": bundle.get(
             "metrics"
+        ),
+        "validation_metrics": bundle.get(
+            "validation_metrics"
+        ),
+        "selection_rule": bundle.get(
+            "selection_rule"
         ),
     }
 
@@ -1033,8 +1044,8 @@ def render_purchase_demo(score, threshold, pred, model_name, input_df, bundle):
         "không phải lời giải thích nội bộ của mô hình."
     )
 
-    # Immediate real explanation for LightGBM
-    if "LightGBM" in bundle["models"]:
+    # Native local contribution chỉ đúng khi prediction hiện tại dùng LightGBM
+    if model_name == "LightGBM" and "LightGBM" in bundle["models"]:
         st.markdown("#### 🧠 5 yếu tố tác động mạnh nhất cho chính khách này")
         try:
             base, raw_score, contrib = get_lgbm_contributions(input_df, bundle)
@@ -1064,6 +1075,11 @@ def render_purchase_demo(score, threshold, pred, model_name, input_df, bundle):
             c3.metric("Sigmoid(raw)", f"{sigmoid(raw_score)*100:.1f}%")
         except Exception as e:
             st.caption(f"Không render được local contribution: {e}")
+    else:
+        st.caption(
+            "Prediction hiện tại không dùng LightGBM. Sang tab 5 để xem "
+            "What-if sensitivity cho đúng model đang chọn."
+        )
 
     # Input summary
     with st.expander("🔎 Xem dữ liệu khách hàng vừa nhập"):
@@ -1517,180 +1533,147 @@ Test = 15\%
 with tabs[2]:
     st.header("3. Model Comparison")
 
-    bundle = st.session_state[
-        "bundle"
-    ]
+    bundle = st.session_state["bundle"]
 
     if bundle is None:
-        st.info(
-            "Train model trước."
-        )
+        st.info("Train 4 model trước để có dữ liệu so sánh.")
     else:
-        metrics = (
-            pd.DataFrame(
-                bundle["metrics"]
+        st.markdown(
+            """
+### Logic chọn model
+
+Không phải **train xong rồi nhìn Test để chọn**. Flow đúng là:
+
+**Train 4 model → Validation chọn model + threshold → khóa lựa chọn → Test báo cáo cuối.**
+
+Vì `Revenue=True` là lớp thiểu số, tiêu chí chính là **PR-AUC trên Validation**.
+Nếu PR-AUC bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
+            """
+        )
+
+        if "validation_metrics" not in bundle:
+            st.warning(
+                "Bundle đang load là phiên bản cũ, chưa lưu Validation metrics. "
+                "Hãy Re-train một lần bằng code FINAL để việc chọn model không dùng Test."
             )
-            .T
+
+        val_metrics_dict = bundle.get("validation_metrics", bundle["metrics"])
+        test_metrics_dict = bundle["metrics"]
+
+        val_metrics = (
+            pd.DataFrame(val_metrics_dict).T
             .reset_index()
-            .rename(
-                columns={
-                    "index": "Model"
-                }
-            )
+            .rename(columns={"index": "Model"})
+        )
+        test_metrics = (
+            pd.DataFrame(test_metrics_dict).T
+            .reset_index()
+            .rename(columns={"index": "Model"})
         )
 
         cols = [
-            "Model",
-            "pr_auc",
-            "roc_auc",
-            "precision",
-            "recall",
-            "f1",
-            "accuracy",
-            "threshold",
+            "Model", "pr_auc", "recall", "f1",
+            "precision", "roc_auc", "accuracy", "threshold"
         ]
 
-        table = metrics[
-            cols
-        ].copy()
-
+        st.subheader("A. Validation — dùng để CHỌN model")
+        val_table = val_metrics[cols].copy()
         for col in cols[1:]:
-            table[col] = (
-                table[col]
-                .astype(float)
-                .round(4)
-            )
-
+            val_table[col] = val_table[col].astype(float).round(4)
         st.dataframe(
-            table.sort_values(
-                "pr_auc",
+            val_table.sort_values(
+                ["pr_auc", "f1", "recall"],
                 ascending=False,
             ),
             use_container_width=True,
             hide_index=True,
         )
 
+        winner = bundle["recommended_model"]
         st.success(
-            "Model tốt nhất theo PR-AUC: "
-            f"**{bundle['recommended_model']}**"
+            f"🏆 Model được chọn: **{winner}** — "
+            f"dựa trên Validation, không nhìn trước Test."
+        )
+        st.caption(
+            bundle.get("selection_rule", "Chọn theo Validation PR-AUC.")
+        )
+
+        winner_row = val_metrics[val_metrics["Model"] == winner].iloc[0]
+        st.markdown(
+            f"**Vì sao {winner} thắng?** Validation PR-AUC = "
+            f"**{float(winner_row['pr_auc']):.4f}**, "
+            f"F1 = **{float(winner_row['f1']):.4f}**, "
+            f"Recall = **{float(winner_row['recall']):.4f}**. "
+            "Theo rule của project, PR-AUC được xét trước."
+        )
+
+        st.subheader("B. Test — chỉ báo cáo cuối")
+        test_table = test_metrics[cols].copy()
+        for col in cols[1:]:
+            test_table[col] = test_table[col].astype(float).round(4)
+        st.dataframe(
+            test_table.sort_values("pr_auc", ascending=False),
+            use_container_width=True,
+            hide_index=True,
         )
 
         metric_name = st.selectbox(
-            "Metric",
-            [
-                "pr_auc",
-                "roc_auc",
-                "f1",
-                "recall",
-                "precision",
-                "accuracy",
-            ],
+            "Vẽ metric nào?",
+            ["pr_auc", "recall", "f1", "precision", "roc_auc", "accuracy"],
         )
+        view_split = st.radio(
+            "Dữ liệu để vẽ",
+            ["Validation", "Test"],
+            horizontal=True,
+        )
+        plot_metrics = val_metrics if view_split == "Validation" else test_metrics
 
         fig = px.bar(
-            metrics.sort_values(
-                metric_name
-            ),
+            plot_metrics.sort_values(metric_name),
             x=metric_name,
             y="Model",
             orientation="h",
             text=metric_name,
-            title=(
-                f"So sánh "
-                f"{metric_name.upper()}"
-            ),
+            title=f"{view_split}: so sánh {metric_name.upper()}",
+        )
+        fig.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.info(
+            "Cách đọc: PR-AUC = tiêu chí chọn chính; Recall = bắt được bao nhiêu "
+            "khách thực sự mua; F1 = cân bằng Precision và Recall. Accuracy chỉ "
+            "là chỉ số bổ sung vì target mất cân bằng."
         )
 
-        fig.update_traces(
-            texttemplate=(
-                "%{text:.3f}"
-            ),
-            textposition="outside",
+        st.subheader("LightGBM Feature Importance — chẩn đoán riêng LightGBM")
+        st.caption(
+            "Phần này giúp hiểu LightGBM, KHÔNG phải quy tắc chọn model. "
+            "Model thắng cuộc vẫn do Validation metrics quyết định."
         )
 
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-        )
-
-        st.subheader(
-            "LightGBM Feature Importance"
-        )
-
-        imp_mode = st.radio(
-            "Importance",
-            ["Gain", "Split"],
-            horizontal=True,
-        )
-
-        imp = bundle[
-            "lgbm_feature_importance"
-        ].copy()
+        imp_mode = st.radio("Importance", ["Gain", "Split"], horizontal=True)
+        imp = bundle["lgbm_feature_importance"].copy()
 
         if imp_mode == "Gain":
-            plot_df = (
-                imp.nlargest(
-                    12,
-                    "gain_pct",
-                )
-                .sort_values(
-                    "gain_pct"
-                )
-            )
-
+            plot_df = imp.nlargest(12, "gain_pct").sort_values("gain_pct")
             fig = px.bar(
-                plot_df,
-                x="gain_pct",
-                y="feature",
-                orientation="h",
-                text="gain_pct",
-                title=(
-                    "Gain importance"
-                ),
+                plot_df, x="gain_pct", y="feature", orientation="h",
+                text="gain_pct", title="LightGBM Gain importance"
             )
-
-            fig.update_traces(
-                texttemplate=(
-                    "%{text:.1f}%"
-                )
-            )
-
+            fig.update_traces(texttemplate="%{text:.1f}%")
             st.caption(
-                "Gain ≠ hướng tác động."
+                "Gain = tổng mức cải thiện objective khi feature được dùng. "
+                "Gain không cho biết hướng tác động."
             )
-
         else:
-            plot_df = (
-                imp.nlargest(
-                    12,
-                    "split",
-                )
-                .sort_values(
-                    "split"
-                )
-            )
-
+            plot_df = imp.nlargest(12, "split").sort_values("split")
             fig = px.bar(
-                plot_df,
-                x="split",
-                y="feature",
-                orientation="h",
-                text="split",
-                title=(
-                    "Split importance"
-                ),
+                plot_df, x="split", y="feature", orientation="h",
+                text="split", title="LightGBM Split importance"
             )
+            st.caption("Split = số lần feature được dùng để chia node.")
 
-            st.caption(
-                "Split = số lần "
-                "feature được dùng."
-            )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-        )
-
+        st.plotly_chart(fig, use_container_width=True)
 
 # ============================================================
 # TAB 4 — LIVE PREDICTION
@@ -1966,6 +1949,9 @@ with tabs[3]:
             st.session_state[
                 "last_input"
             ] = input_df
+            st.session_state[
+                "last_model_name"
+            ] = model_name
 
             c1, c2, c3 = st.columns(3)
 
@@ -2018,229 +2004,433 @@ with tabs[3]:
 # ============================================================
 
 with tabs[4]:
-    st.header(
-        "5. Explain Prediction"
-    )
+    st.header("5. Explain Prediction")
 
-    bundle = st.session_state[
-        "bundle"
-    ]
+    bundle = st.session_state["bundle"]
 
     if bundle is None:
-        st.info(
-            "Train model trước."
-        )
-
+        st.info("Train/load model trước.")
     elif "last_input" not in st.session_state:
-        st.info(
-            "Predict một sample trước."
-        )
-
+        st.info("Hãy sang Live Prediction và Predict một sample trước.")
     else:
-        base, raw_score, contrib = (
-            get_lgbm_contributions(
-                st.session_state[
-                    "last_input"
-                ],
-                bundle,
-            )
+        model_name = st.session_state.get(
+            "last_model_name", bundle["recommended_model"]
         )
-
-        score = sigmoid(
-            raw_score
-        )
+        input_df = st.session_state["last_input"]
 
         st.markdown(
-            r"""
-\[
-F(x)
-=
-E[F(x)]
-+
-\sum_j \phi_j
-\]
+            f"""
+### Đang giải thích prediction của **{model_name}**
 
-\[
-score
-=
-\sigma(F(x))
-\]
+Có 2 mức giải thích:
 
-- \(\phi_j>0\): đẩy về Mua.
-- \(\phi_j<0\): đẩy về Không mua.
-"""
+1. **What-if sensitivity** — dùng được cho cả 4 model: thay từng feature về baseline của TRAIN và xem score đổi bao nhiêu.
+2. **Native LightGBM contribution** — chỉ khi model là LightGBM: phân rã raw score thành base value + đóng góp feature.
+            """
         )
 
+        score, threshold, pred, sensitivity = get_what_if_sensitivity(
+            model_name, input_df, bundle
+        )
         c1, c2, c3 = st.columns(3)
+        c1.metric("Model score", f"{score*100:.2f}%")
+        c2.metric("Threshold", f"{threshold:.3f}")
+        c3.metric("Prediction", "MUA" if pred else "KHÔNG MUA")
 
-        c1.metric(
-            "Base raw score",
-            f"{base:.4f}",
+        st.subheader("A. What-if sensitivity — dễ hiểu, dùng cho mọi model")
+        st.markdown(
+            """
+Với từng feature, app hỏi: **nếu giữ mọi thứ như cũ nhưng thay riêng feature này bằng giá trị baseline của TRAIN thì score thay đổi bao nhiêu?**
+
+- `score_delta > 0`: giá trị hiện tại đang đẩy score Mua **cao hơn baseline**.
+- `score_delta < 0`: giá trị hiện tại đang kéo score Mua **thấp hơn baseline**.
+- Các delta này **không cộng lại chính xác thành score**; đây là phân tích what-if, không phải SHAP.
+            """
         )
-
-        c2.metric(
-            "Final raw score",
-            f"{raw_score:.4f}",
+        top = sensitivity.head(10).copy().sort_values("score_delta")
+        top["direction"] = np.where(
+            top["score_delta"] >= 0,
+            "Đẩy score cao hơn baseline",
+            "Kéo score thấp hơn baseline",
         )
-
-        c3.metric(
-            "Sigmoid(raw score)",
-            f"{score*100:.2f}%",
-        )
-
-        top = (
-            contrib.head(10)
-            .copy()
-        )
-
-        top[
-            "direction"
-        ] = np.where(
-            top[
-                "contribution"
-            ] >= 0,
-            "Đẩy về Mua",
-            "Đẩy về Không mua",
-        )
-
-        top = top.sort_values(
-            "contribution"
-        )
-
         fig = px.bar(
-            top,
-            x="contribution",
-            y="feature",
-            orientation="h",
-            color="direction",
-            title=(
-                "Local feature contribution"
-            ),
+            top, x="score_delta", y="feature", orientation="h",
+            color="direction", title=f"What-if sensitivity — {model_name}"
         )
-
-        st.plotly_chart(
-            fig,
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(
+            sensitivity.head(10)[
+                ["feature", "current_value", "baseline_value", "score_delta"]
+            ],
             use_container_width=True,
+            hide_index=True,
         )
 
-        st.caption(
-            "Đây là contribution lấy trực tiếp "
-            "từ LightGBM, không phải if/else tự viết."
-        )
+        if model_name == "LightGBM":
+            st.subheader("B. Native LightGBM contribution — phân rã raw score")
+            base, raw_score, contrib = get_lgbm_contributions(input_df, bundle)
+            probability_like_score = sigmoid(raw_score)
+            st.markdown(
+                r"""
+LightGBM có thể trả contribution trực tiếp:
 
+\[
+F(x)=BaseValue+\sum_j \phi_j
+\]
+
+Sau đó:
+
+\[
+score=\sigma(F(x))=\frac{1}{1+e^{-F(x)}}
+\]
+
+- \(\phi_j>0\): đẩy raw score về phía Mua.
+- \(\phi_j<0\): đẩy raw score về phía Không mua.
+                """
+            )
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Base raw score", f"{base:.4f}")
+            d2.metric("Final raw score", f"{raw_score:.4f}")
+            d3.metric("Sigmoid(raw)", f"{probability_like_score*100:.2f}%")
+
+            topc = contrib.head(10).copy().sort_values("contribution")
+            topc["direction"] = np.where(
+                topc["contribution"] >= 0,
+                "Đẩy về Mua",
+                "Đẩy về Không mua",
+            )
+            fig2 = px.bar(
+                topc, x="contribution", y="feature", orientation="h",
+                color="direction", title="Native LightGBM local contribution"
+            )
+            st.plotly_chart(fig2, use_container_width=True)
+            st.caption(
+                "Đây là contribution lấy trực tiếp từ LightGBM, "
+                "không phải rule if/else tự viết."
+            )
+        else:
+            st.info(
+                "Native additive contribution trong app hiện chỉ có cho LightGBM. "
+                "Với model này, phần A vẫn giải thích prediction bằng phân tích what-if nhất quán."
+            )
 
 # ============================================================
 # TAB 6 — CODE ↔ MATH
 # ============================================================
 
 with tabs[5]:
-    st.header(
-        "6. Code ↔ Toán ↔ Ý nghĩa"
-    )
+    st.header("6. Code ↔ Math — học từ đầu, không học thuộc công thức")
 
     st.markdown(
-        r"""
-### Decision Tree
+        """
+Trang này trả lời một câu duy nhất: **mỗi dòng code trong project đang đại diện cho ý tưởng toán học nào?**
 
-```python
-criterion="gini"
-max_depth=5
-```
+Hãy đọc theo flow:
 
-\[
-Gini(S)
-=
-1-\sum_k p_k^2
-\]
-
----
-
-### Bagging
-
-```python
-bootstrap=True
-n_estimators=120
-```
-
-\[
-D_b
-\sim
-Bootstrap(D)
-\]
-
-\[
-\hat y
-=
-mode(
-h_1(x),...,h_B(x)
-)
-\]
-
----
-
-### Random Forest
-
-```python
-max_features="sqrt"
-```
-
-\[
-m
-\approx
-\sqrt{p}
-\]
-
-Random Forest = Bagging + random feature subset.
-
----
-
-### LightGBM
-
-```python
-learning_rate=0.03
-reg_lambda=1.0
-scale_pos_weight=...
-```
-
-Boosting:
-
-\[
-F_m(x)
-=
-F_{m-1}(x)
-+
-\eta f_m(x)
-\]
-
-với:
-
-\[
-\eta=0.03
-\]
-
-Binary loss:
-
-\[
-L_i
-=
--w_i
-[
-y_i\log p_i
-+
-(1-y_i)\log(1-p_i)
-]
-\]
-
-`scale_pos_weight` là class weighting.
-
-`reg_lambda` mới là L2 regularization:
-
-\[
-\lambda
-\]
-"""
+**Dữ liệu → Vector x,y → Decision Tree → Bagging → Random Forest → LightGBM → Score → Threshold → Mua/Không mua**
+        """
     )
 
+    math_tabs = st.tabs(
+        [
+            "0️⃣ Bản đồ tổng",
+            "1️⃣ Data → Vector",
+            "2️⃣ Decision Tree",
+            "3️⃣ Bagging",
+            "4️⃣ Random Forest",
+            "5️⃣ LightGBM",
+            "6️⃣ Prediction & Metrics",
+        ]
+    )
+
+    with math_tabs[0]:
+        st.subheader("Bản đồ toàn bộ project")
+        st.code(
+            """Dataset (12,330 sessions)
+        ↓
+Preprocessing
+        ↓
+Split: Train 70% | Validation 15% | Test 15%
+        ↓
+Train 4 models
+  ├─ Decision Tree
+  ├─ Bagging
+  ├─ Random Forest
+  └─ LightGBM
+        ↓
+Validation: chọn threshold + chọn model theo PR-AUC
+        ↓
+Khóa model thắng cuộc
+        ↓
+Test: báo cáo cuối
+        ↓
+New customer → score → threshold → Mua / Không mua""",
+            language="text",
+        )
+        st.success(
+            "Điểm phải nhớ: Test KHÔNG dùng để chọn model. "
+            "Validation mới dùng để chọn; Test chỉ kiểm tra cuối."
+        )
+
+    with math_tabs[1]:
+        st.subheader("1. Một dòng dữ liệu biến thành vector như thế nào?")
+        st.markdown(
+            r"""
+Một phiên truy cập có 17 feature. Ta viết ngắn gọn:
+
+\[
+x=[x_1,x_2,\ldots,x_{17}]
+\]
+
+Target:
+
+\[
+y=Revenue\in\{0,1\}
+\]
+
+- \(y=1\): khách mua.
+- \(y=0\): khách không mua.
+
+Ví dụ: `PageValues`, `BounceRates`, `Month`, `VisitorType`... là các thành phần của \(x\).
+            """
+        )
+        st.code(
+            'X = df.drop(columns=["Revenue"])\n'
+            'y = df["Revenue"]\n\n'
+            '# 70 / 15 / 15\n'
+            'X_train, X_val, X_test, ... = split_data(df)',
+            language="python",
+        )
+        st.info("Code đang làm đúng phép tách toán học: X = đầu vào, y = nhãn cần học.")
+
+    with math_tabs[2]:
+        st.subheader("2. Decision Tree — model đang chọn câu hỏi tốt nhất")
+        st.markdown(
+            r"""
+Giả sử một node có 100 khách: 85 Không mua và 15 Mua. Node này còn lẫn hai lớp nên chưa "thuần".
+
+Gini impurity:
+
+\[
+Gini(S)=1-\sum_k p_k^2
+\]
+
+Với bài toán 2 lớp:
+
+\[
+Gini(S)=1-p_0^2-p_1^2
+\]
+
+Tree thử nhiều câu hỏi kiểu `PageValues <= 12.5 ?` và chọn split làm impurity sau chia nhỏ nhất, hay tương đương làm **Gini giảm nhiều nhất**:
+
+\[
+\Delta Gini = Gini(parent)-\left(\frac{N_L}{N}Gini(L)+\frac{N_R}{N}Gini(R)\right)
+\]
+            """
+        )
+        st.code(
+            'DecisionTreeClassifier(\n'
+            '    criterion="gini",   # dùng Gini impurity\n'
+            '    max_depth=5,        # giới hạn độ sâu\n'
+            '    min_samples_leaf=20,\n'
+            '    class_weight="balanced"\n'
+            ')',
+            language="python",
+        )
+        st.success(
+            "Cách nhớ: Decision Tree = liên tục hỏi câu hỏi làm hai nhóm Mua/Không mua tách nhau rõ hơn."
+        )
+
+    with math_tabs[3]:
+        st.subheader("3. Bagging — nhiều cây độc lập rồi bỏ phiếu")
+        st.markdown(
+            r"""
+Một Decision Tree có thể thay đổi mạnh khi dữ liệu train thay đổi. Bagging giảm vấn đề này bằng cách tạo nhiều bộ dữ liệu bootstrap:
+
+\[
+D_b\sim Bootstrap(D),\quad b=1,2,\ldots,B
+\]
+
+Mỗi \(D_b\) train một cây \(h_b\). Với classification, prediction cuối được tổng hợp từ các cây:
+
+\[
+\hat y = mode\{h_1(x),h_2(x),\ldots,h_B(x)\}
+\]
+
+`bootstrap=True` nghĩa là lấy mẫu **có hoàn lại**. Một dòng có thể xuất hiện nhiều lần, dòng khác có thể không xuất hiện trong một bootstrap sample.
+            """
+        )
+        st.code(
+            'BaggingClassifier(\n'
+            '    estimator=DecisionTreeClassifier(...),\n'
+            '    n_estimators=120,   # B = 120 cây\n'
+            '    bootstrap=True     # D_b ~ Bootstrap(D)\n'
+            ')',
+            language="python",
+        )
+        st.success(
+            "Cách nhớ: Tree dễ dao động → train nhiều Tree trên nhiều bootstrap sample → vote → giảm variance."
+        )
+
+    with math_tabs[4]:
+        st.subheader("4. Random Forest — Bagging + random feature")
+        p_features = 17
+        approx_features = math.sqrt(p_features)
+        st.markdown(
+            rf"""
+Random Forest vẫn dùng nhiều cây + bootstrap giống Bagging, nhưng tại mỗi split nó chỉ cho cây nhìn **một tập con feature ngẫu nhiên**.
+
+Nếu có \(p={p_features}\) feature và dùng `max_features="sqrt"`:
+
+\[
+m\approx\sqrt{{p}}=\sqrt{{{p_features}}}\approx {approx_features:.2f}
+\]
+
+Tức là tại một split, model thường chỉ xét khoảng **4 feature**, thay vì luôn xét cả 17.
+
+Mục tiêu: làm các cây **bớt giống nhau**, tức giảm correlation giữa các cây.
+            """
+        )
+        st.code(
+            'RandomForestClassifier(\n'
+            '    n_estimators=250,\n'
+            '    bootstrap=True,       # giống Bagging\n'
+            '    max_features="sqrt", # random feature subset\n'
+            '    max_depth=8\n'
+            ')',
+            language="python",
+        )
+        st.success("Cách nhớ: Random Forest = Bagging + random feature selection.")
+
+    with math_tabs[5]:
+        st.subheader("5. LightGBM — các cây học tuần tự để cải thiện lỗi")
+        st.markdown(
+            r"""
+Khác Bagging/Random Forest, Boosting không xây các cây hoàn toàn độc lập. Nó xây tuần tự:
+
+\[
+F_m(x)=F_{m-1}(x)+\eta f_m(x)
+\]
+
+Trong đó:
+
+- \(F_{m-1}(x)\): ensemble trước khi thêm cây mới.
+- \(f_m(x)\): cây mới.
+- \(\eta\): learning rate, điều khiển cây mới đóng góp mạnh đến đâu.
+
+Với binary classification, một dạng loss phổ biến là binary log-loss:
+
+\[
+L_i=-w_i\left[y_i\log p_i+(1-y_i)\log(1-p_i)\right]
+\]
+
+LightGBM dùng thông tin đạo hàm của loss:
+
+\[
+g_i=\frac{\partial L}{\partial F(x_i)},\qquad
+h_i=\frac{\partial^2 L}{\partial F(x_i)^2}
+\]
+
+Gradient cho biết hướng loss thay đổi; Hessian cho biết độ cong. LightGBM dùng chúng để tìm các split/cây giúp objective tốt hơn.
+            """
+        )
+        st.code(
+            'LGBMClassifier(\n'
+            '    n_estimators=500,       # tối đa M vòng boosting\n'
+            '    learning_rate=0.03,     # eta = 0.03\n'
+            '    max_depth=5,\n'
+            '    num_leaves=25,\n'
+            '    reg_lambda=1.0,         # lambda: L2 regularization\n'
+            '    scale_pos_weight=...    # trọng số lớp Mua\n'
+            ')',
+            language="python",
+        )
+        if st.session_state["bundle"] is not None:
+            b = st.session_state["bundle"]
+            st.metric(
+                "scale_pos_weight hiện tại",
+                f"{b['scale_pos_weight']:.3f}",
+                help="N_negative / N_positive trên TRAIN",
+            )
+        st.warning(
+            "Đừng nhầm: scale_pos_weight là class weighting; "
+            "reg_lambda mới liên hệ với λ của L2 regularization."
+        )
+        st.success(
+            "Cách nhớ: LightGBM = cây sau được thêm vào để cải thiện ensemble hiện tại; "
+            "learning_rate quyết định bước cải thiện lớn hay nhỏ."
+        )
+
+    with math_tabs[6]:
+        st.subheader("6. Từ score đến quyết định Mua / Không mua")
+        st.markdown(
+            r"""
+Sau khi model tạo score \(s(x)\), ta so với threshold \(t\):
+
+\[
+\hat y=
+\begin{cases}
+1 & s(x)\ge t\\
+0 & s(x)<t
+\end{cases}
+\]
+
+Trong project, threshold được chọn trên **Validation** bằng F1 tốt nhất, sau đó khóa lại và mang sang Test.
+
+### Ba metric chính
+
+**Recall** — trong khách thực sự Mua, bắt được bao nhiêu:
+
+\[
+Recall=\frac{TP}{TP+FN}
+\]
+
+**F1** — cân bằng Precision và Recall:
+
+\[
+F1=2\frac{Precision\cdot Recall}{Precision+Recall}
+\]
+
+**PR-AUC** — tóm tắt quan hệ Precision–Recall qua nhiều threshold; đây là tiêu chí chính để chọn model vì lớp Mua là lớp thiểu số.
+            """
+        )
+        st.code(
+            '# threshold chọn trên VALIDATION\n'
+            'threshold = choose_threshold(y_val, val_prob)\n\n'
+            '# model winner chọn bằng VALIDATION PR-AUC\n'
+            'recommended_model = max(\n'
+            '    validation_results,\n'
+            '    key=lambda name: (\n'
+            '        validation_results[name]["pr_auc"],\n'
+            '        validation_results[name]["f1"],\n'
+            '        validation_results[name]["recall"],\n'
+            '    ),\n'
+            ')\n\n'
+            '# TEST chỉ dùng báo cáo sau khi đã khóa model + threshold',
+            language="python",
+        )
+        st.error(
+            "Sai về phương pháp: dùng Test để chọn model hoặc tune threshold. "
+            "Đúng: Validation chọn; Test chỉ báo cáo cuối."
+        )
+
+    with st.expander("📘 Từ điển 12 từ phải nhớ"):
+        st.markdown(
+            """
+- **Feature**: biến đầu vào.
+- **Target/Label**: nhãn cần dự đoán.
+- **Train**: dữ liệu để model học.
+- **Validation**: dữ liệu để chọn model/threshold/hyperparameter.
+- **Test**: dữ liệu kiểm tra cuối.
+- **Split**: phép chia node của cây.
+- **Leaf**: node cuối của cây.
+- **Bootstrap**: lấy mẫu ngẫu nhiên có hoàn lại.
+- **Ensemble**: tổ hợp nhiều model.
+- **Boosting**: học tuần tự để cải thiện lỗi.
+- **Threshold**: ngưỡng biến score thành 0/1.
+- **PR-AUC**: chất lượng Precision–Recall qua nhiều threshold.
+            """
+        )
 
 # ============================================================
 # TAB 7 — GITHUB
