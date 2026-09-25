@@ -301,7 +301,7 @@ def evaluate_model(y_true, prob, threshold):
         "roc_auc": float(
             roc_auc_score(y_true, prob)
         ),
-        "pr_auc": float(
+        "ap": float(
             average_precision_score(y_true, prob)
         ),
         "tn": int(tn),
@@ -339,7 +339,7 @@ def train_everything(df, category_levels):
     - VALIDATION: chọn threshold + chọn model thắng cuộc.
     - TEST: chỉ dùng báo cáo cuối, KHÔNG dùng để chọn model.
 
-    Model được chọn theo VALIDATION PR-AUC. Nếu bằng nhau, dùng F1 rồi
+    Model được chọn theo VALIDATION AP. Nếu bằng nhau, dùng F1 rồi
     Recall làm tie-breaker.
     """
     X_train, X_val, X_test, y_train, y_val, y_test = split_data(df)
@@ -432,7 +432,7 @@ def train_everything(df, category_levels):
         max_depth=5,
         num_leaves=25,
         min_child_samples=20,
-        subsample=0.9,
+        subsample=0.9,  # row subsampling is inactive unless subsample_freq/bagging_freq > 0
         colsample_bytree=0.9,
         reg_alpha=0.0,
         reg_lambda=1.0,
@@ -477,7 +477,7 @@ def train_everything(df, category_levels):
     ranking = sorted(
         validation_results.items(),
         key=lambda kv: (
-            kv[1]["pr_auc"],
+            kv[1]["ap"],
             kv[1]["f1"],
             kv[1]["recall"],
         ),
@@ -489,9 +489,13 @@ def train_everything(df, category_levels):
         "models": models,
         "metrics": test_results,  # TEST metrics
         "validation_metrics": validation_results,
+        "selected_thresholds": {
+            name: float(metrics["threshold"])
+            for name, metrics in validation_results.items()
+        },
         "recommended_model": recommended_model,
         "selection_rule": (
-            "Chọn model theo Validation PR-AUC; "
+            "Chọn model theo Validation AP; "
             "nếu bằng nhau dùng F1 rồi Recall."
         ),
         "feature_order": list(X_train.columns),
@@ -514,6 +518,35 @@ def train_everything(df, category_levels):
         "lgbm_feature_importance": importance,
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
     }
+
+    return bundle
+
+
+def normalize_legacy_bundle_metrics(bundle):
+    """Backward compatibility: old saved bundles used key `pr_auc` for AP.
+    Rename it to `ap` without changing the underlying numeric value.
+    Also expose validation-selected thresholds explicitly.
+    """
+    if bundle is None:
+        return None
+
+    for bucket_name in ("metrics", "validation_metrics"):
+        bucket = bundle.get(bucket_name, {})
+        for _, m in bucket.items():
+            if "ap" not in m and "pr_auc" in m:
+                m["ap"] = m["pr_auc"]
+
+    if "selected_thresholds" not in bundle:
+        source = bundle.get("validation_metrics", {})
+        bundle["selected_thresholds"] = {
+            name: float(metrics["threshold"])
+            for name, metrics in source.items()
+            if isinstance(metrics, dict) and "threshold" in metrics
+        }
+
+    rule = bundle.get("selection_rule")
+    if isinstance(rule, str):
+        bundle["selection_rule"] = rule.replace("PR-AUC", "AP")
 
     return bundle
 
@@ -551,9 +584,13 @@ def score_one(model_name, row_df, bundle):
     )
 
     threshold = float(
-        bundle["metrics"][
-            model_name
-        ]["threshold"]
+        bundle.get("selected_thresholds", {}).get(
+            model_name,
+            bundle.get("validation_metrics", {}).get(
+                model_name,
+                bundle["metrics"][model_name],
+            )["threshold"],
+        )
     )
 
     pred = int(score >= threshold)
@@ -1099,7 +1136,7 @@ if "dataset_name" not in st.session_state:
 if "bundle" not in st.session_state:
     # QUAN TRỌNG:
     # Khi app khởi động, tự load model đã train trước đó.
-    st.session_state["bundle"] = load_saved_bundle()
+    st.session_state["bundle"] = normalize_legacy_bundle_metrics(load_saved_bundle())
 
 
 # ============================================================
@@ -1238,10 +1275,10 @@ with st.sidebar:
                     "Đang train Decision Tree, "
                     "Bagging, Random Forest, LightGBM..."
                 ):
-                    bundle = train_everything(
+                    bundle = normalize_legacy_bundle_metrics(train_everything(
                         clean_df,
                         category_levels,
-                    )
+                    ))
 
                 st.session_state[
                     "dataset"
@@ -1446,7 +1483,7 @@ Y = Revenue \in \{0,1\}
             st.warning(
                 "Target mất cân bằng → "
                 "không chỉ nhìn Accuracy. "
-                "Ưu tiên PR-AUC, Recall, F1."
+                "Ưu tiên AP, Recall, F1."
             )
 
 
@@ -1478,8 +1515,8 @@ Test = 15\%
 \]
 
 - Train: học model.
-- Validation: early stopping + chọn threshold.
-- Test: đánh giá cuối.
+- Validation: early stopping cho LightGBM + chọn threshold + chọn model.
+- Test: chỉ đánh giá cuối.
 """
     )
 
@@ -1546,8 +1583,8 @@ Không phải **train xong rồi nhìn Test để chọn**. Flow đúng là:
 
 **Train 4 model → Validation chọn model + threshold → khóa lựa chọn → Test báo cáo cuối.**
 
-Vì `Revenue=True` là lớp thiểu số, tiêu chí chính là **PR-AUC trên Validation**.
-Nếu PR-AUC bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
+Vì `Revenue=True` là lớp thiểu số, tiêu chí chính là **AP trên Validation**.
+Nếu AP bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
             """
         )
 
@@ -1572,7 +1609,7 @@ Nếu PR-AUC bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
         )
 
         cols = [
-            "Model", "pr_auc", "recall", "f1",
+            "Model", "ap", "recall", "f1",
             "precision", "roc_auc", "accuracy", "threshold"
         ]
 
@@ -1582,7 +1619,7 @@ Nếu PR-AUC bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
             val_table[col] = val_table[col].astype(float).round(4)
         st.dataframe(
             val_table.sort_values(
-                ["pr_auc", "f1", "recall"],
+                ["ap", "f1", "recall"],
                 ascending=False,
             ),
             use_container_width=True,
@@ -1595,16 +1632,16 @@ Nếu PR-AUC bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
             f"dựa trên Validation, không nhìn trước Test."
         )
         st.caption(
-            bundle.get("selection_rule", "Chọn theo Validation PR-AUC.")
+            bundle.get("selection_rule", "Chọn theo Validation AP.")
         )
 
         winner_row = val_metrics[val_metrics["Model"] == winner].iloc[0]
         st.markdown(
-            f"**Vì sao {winner} thắng?** Validation PR-AUC = "
-            f"**{float(winner_row['pr_auc']):.4f}**, "
+            f"**Vì sao {winner} thắng?** Validation AP = "
+            f"**{float(winner_row['ap']):.4f}**, "
             f"F1 = **{float(winner_row['f1']):.4f}**, "
             f"Recall = **{float(winner_row['recall']):.4f}**. "
-            "Theo rule của project, PR-AUC được xét trước."
+            "Theo rule của project, AP được xét trước."
         )
 
         st.subheader("B. Test — chỉ báo cáo cuối")
@@ -1612,14 +1649,14 @@ Nếu PR-AUC bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
         for col in cols[1:]:
             test_table[col] = test_table[col].astype(float).round(4)
         st.dataframe(
-            test_table.sort_values("pr_auc", ascending=False),
+            test_table.sort_values("ap", ascending=False),
             use_container_width=True,
             hide_index=True,
         )
 
         metric_name = st.selectbox(
             "Vẽ metric nào?",
-            ["pr_auc", "recall", "f1", "precision", "roc_auc", "accuracy"],
+            ["ap", "recall", "f1", "precision", "roc_auc", "accuracy"],
         )
         view_split = st.radio(
             "Dữ liệu để vẽ",
@@ -1640,7 +1677,7 @@ Nếu PR-AUC bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
         st.plotly_chart(fig, use_container_width=True)
 
         st.info(
-            "Cách đọc: PR-AUC = tiêu chí chọn chính; Recall = bắt được bao nhiêu "
+            "Cách đọc: AP = tiêu chí chọn chính; Recall = bắt được bao nhiêu "
             "khách thực sự mua; F1 = cân bằng Precision và Recall. Accuracy chỉ "
             "là chỉ số bổ sung vì target mất cân bằng."
         )
@@ -2158,7 +2195,7 @@ Train 4 models
   ├─ Random Forest
   └─ LightGBM
         ↓
-Validation: chọn threshold + chọn model theo PR-AUC
+Validation: chọn threshold + chọn model theo AP
         ↓
 Khóa model thắng cuộc
         ↓
@@ -2391,17 +2428,17 @@ Recall=\frac{TP}{TP+FN}
 F1=2\frac{Precision\cdot Recall}{Precision+Recall}
 \]
 
-**PR-AUC** — tóm tắt quan hệ Precision–Recall qua nhiều threshold; đây là tiêu chí chính để chọn model vì lớp Mua là lớp thiểu số.
+**AP (Average Precision)** — tổng hợp Precision theo các mức Recall; đây là tiêu chí chính để chọn model vì lớp Mua là lớp thiểu số.
             """
         )
         st.code(
             '# threshold chọn trên VALIDATION\n'
             'threshold = choose_threshold(y_val, val_prob)\n\n'
-            '# model winner chọn bằng VALIDATION PR-AUC\n'
+            '# model winner chọn bằng VALIDATION AP\n'
             'recommended_model = max(\n'
             '    validation_results,\n'
             '    key=lambda name: (\n'
-            '        validation_results[name]["pr_auc"],\n'
+            '        validation_results[name]["ap"],\n'
             '        validation_results[name]["f1"],\n'
             '        validation_results[name]["recall"],\n'
             '    ),\n'
@@ -2428,7 +2465,7 @@ F1=2\frac{Precision\cdot Recall}{Precision+Recall}
 - **Ensemble**: tổ hợp nhiều model.
 - **Boosting**: học tuần tự để cải thiện lỗi.
 - **Threshold**: ngưỡng biến score thành 0/1.
-- **PR-AUC**: chất lượng Precision–Recall qua nhiều threshold.
+- **AP**: chất lượng Precision–Recall qua nhiều threshold.
             """
         )
 
