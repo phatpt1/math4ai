@@ -8,11 +8,9 @@ import streamlit as st
 
 from ui.sidebar import init_session_state, render_sidebar
 from ui.tabs import (
-    code_math,
     comparison,
     eda,
     explain,
-    github,
     prediction,
     training,
 )
@@ -48,8 +46,6 @@ tabs = st.tabs(
         "3️⃣ Model Comparison",
         "4️⃣ Live Prediction",
         "5️⃣ Explain Prediction",
-        "6️⃣ Code ↔ Math",
-        "7️⃣ GitHub",
     ]
 )
 
@@ -67,9 +63,3 @@ with tabs[3]:
 
 with tabs[4]:
     explain.render()
-
-with tabs[5]:
-    code_math.render()
-
-with tabs[6]:
-    github.render()
