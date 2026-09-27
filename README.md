@@ -71,7 +71,7 @@ UI và CLI dùng chung một logic train (`src/models.py → train_everything`),
 
 ```bash
 python3.12 -m venv .venv
-source .venv/bin/activate        # Windows: .venv\Scripts\activate
+source .venv/bin/activate 
 pip install -r requirements.txt
 ```
 
