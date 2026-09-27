@@ -4,7 +4,6 @@ import streamlit as st
 from src.config import TARGET
 from src.data import normalize_dataset
 
-
 def render():
     st.header("1. Bài toán và dữ liệu")
 
@@ -14,12 +13,12 @@ def render():
 
 Dựa trên hành vi của một phiên truy cập website:
 
-\[
-Y = Revenue \in \{0,1\}
-\]
+$$
+Y = \text{Revenue} \in \{0, 1\}
+$$
 
-- \(Y=1\): mua hàng.
-- \(Y=0\): không mua.
+- $Y = 1$: mua hàng.
+- $Y = 0$: không mua.
 
 Đây là bài toán **binary classification**.
 """
@@ -44,19 +43,23 @@ Y = Revenue \in \{0,1\}
     if TARGET in preview.columns:
         try:
             rate = float(preview[TARGET].astype(int).mean())
-            c4.metric("Purchase rate", f"{rate*100:.2f}%")
+            c4.metric("Purchase rate", f"{rate * 100:.2f}%")
         except Exception:
             c4.metric("Purchase rate", "N/A")
 
-    st.dataframe(preview.head(20), use_container_width=True)
+    st.dataframe(preview.head(20), width="stretch")
 
     if TARGET in preview.columns:
         target_counts = (
             preview[TARGET]
-            .astype(str)
+            .astype(int)
             .value_counts()
+            .sort_index()
             .rename_axis("Revenue")
             .reset_index(name="Count")
+        )
+        target_counts["Revenue"] = target_counts["Revenue"].map(
+            {0: "0 - Not purchased", 1: "1 - Purchased"}
         )
 
         fig = px.bar(
@@ -66,7 +69,9 @@ Y = Revenue \in \{0,1\}
             text="Count",
             title="Phân bố target Revenue",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_xaxes(type="category")
+        fig.update_traces(textposition="outside")
+        st.plotly_chart(fig, width="stretch")
 
         st.warning(
             "Target mất cân bằng → không chỉ nhìn Accuracy. Ưu tiên AP, Recall, F1."
