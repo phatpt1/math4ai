@@ -4,7 +4,7 @@ import streamlit as st
 
 from src.data import normalize_dataset
 from src.models import train_everything
-from src.storage import save_bundle_local, serialize_bundle
+from src.storage import save_bundle_local
 
 MODEL_SETUP = pd.DataFrame(
     [
@@ -35,27 +35,6 @@ MODEL_SETUP = pd.DataFrame(
     ]
 )
 
-PIPELINE_DOT = """
-digraph {
-    rankdir=LR;
-    node [shape=box, style="rounded,filled", fillcolor="#1f2937", fontcolor="white", color="#4b5563"];
-    edge [color="#9ca3af"];
-
-    data [label="Dataset\\n12,330 rows"];
-    split [label="Stratified split\\n70 / 15 / 15"];
-    train [label="Train\\nfit encoder + fit model"];
-    val [label="Validation\\nearly stopping\\nthreshold (max F1)\\nmodel selection"];
-    test [label="Test\\nfinal report only", fillcolor="#7f1d1d"];
-
-    data -> split;
-    split -> train;
-    split -> val;
-    split -> test;
-    train -> val [label="predict"];
-    val -> test [label="best model + threshold"];
-}
-"""
-
 
 def _render_theory():
     st.markdown(
@@ -66,19 +45,12 @@ $$
 \text{Train} = 70\% \quad | \quad \text{Validation} = 15\% \quad | \quad \text{Test} = 15\%
 $$
 
-- **Train:** học model.
+- **Train:** học model (encoder cũng chỉ fit trên Train).
 - **Validation:** early stopping cho LightGBM, chọn threshold, chọn model.
-- **Test:** chỉ đánh giá cuối, không dùng để tinh chỉnh.
+- **Test:** chỉ đánh giá cuối, không dùng để tinh chỉnh → tránh **data leakage**.
 
 Chia theo **stratified** để 3 tập giữ cùng tỷ lệ mua (~15.5%).
 """
-    )
-
-    st.subheader("Pipeline chống data leakage")
-    st.graphviz_chart(PIPELINE_DOT, width="stretch")
-    st.caption(
-        "Encoder và model chỉ được fit trên Train. "
-        "Validation và Test không tham gia vào quá trình học."
     )
 
     st.subheader("4 model so sánh")
@@ -86,24 +58,20 @@ Chia theo **stratified** để 3 tập giữ cùng tỷ lệ mua (~15.5%).
 
 
 def _render_train_action():
-    st.subheader("Train model")
-
     df = st.session_state["dataset"]
     if df is None:
-        st.info("Chưa có dataset. Upload ở tab 1️⃣.")
+        st.info("Chưa có dataset.")
         return
 
-    st.caption(f"Dataset: `{st.session_state.get('dataset_name')}` · {len(df):,} rows")
+    c1, c2 = st.columns([3, 1])
+    c1.caption(f"Dataset: `{st.session_state.get('dataset_name')}` · {len(df):,} rows")
 
-    if st.button("🧠 Train + lưu model local", type="primary"):
+    if c2.button("🧠 Train lại model", type="primary", width="stretch"):
         try:
-            with st.spinner("Đang chuẩn hóa dữ liệu..."):
-                clean_df, category_levels = normalize_dataset(df)
-
             with st.spinner("Đang train Decision Tree, Bagging, Random Forest, LightGBM..."):
+                clean_df, category_levels = normalize_dataset(df)
                 bundle = train_everything(clean_df, category_levels)
-
-            path = save_bundle_local(bundle)
+                path = save_bundle_local(bundle)
 
             st.session_state["dataset"] = clean_df
             st.session_state["bundle"] = bundle
@@ -120,21 +88,18 @@ def _render_train_action():
 def _render_learning_curve(evals, best_iter):
     fig = go.Figure()
     for set_name, metrics in evals.items():
-        for metric_name, values in metrics.items():
+        for values in metrics.values():
             fig.add_trace(
                 go.Scatter(
                     x=list(range(1, len(values) + 1)),
                     y=values,
                     mode="lines",
-                    name=f"{set_name} - {metric_name}",
+                    name=set_name.capitalize(),
+                    line=dict(dash="dash" if set_name == "validation" else "solid"),
                 )
             )
     if best_iter:
-        fig.add_vline(
-            x=best_iter,
-            line_dash="dash",
-            annotation_text=f"best iteration = {best_iter}",
-        )
+        fig.add_vline(x=best_iter, line_dash="dot", annotation_text=f"best iteration = {best_iter}")
     fig.update_layout(
         title="LightGBM learning curve",
         xaxis_title="Boosting iteration",
@@ -156,25 +121,20 @@ def _render_results(bundle):
     spw = bundle["scale_pos_weight"]
     best_iter = bundle.get("lgbm_best_iteration")
 
-    c1, c2 = st.columns(2)
-    c1.metric("scale_pos_weight", f"{spw:.3f}")
-    c2.metric("LightGBM best iteration", best_iter)
-
     st.markdown(
         rf"""
 $$
 \text{{scale\_pos\_weight}} = \frac{{\#\text{{không mua (Train)}}}}{{\#\text{{mua (Train)}}}} \approx {spw:.2f}
 $$
 
-→ Mỗi lỗi bỏ sót khách **mua** bị phạt nặng gấp ~{spw:.1f} lần, giúp model không thiên về lớp đa số.
+→ Mỗi lỗi bỏ sót khách **mua** bị phạt nặng gấp ~{spw:.1f} lần. LightGBM dừng sớm ở **{best_iter} cây** (tối đa 500).
 """
     )
 
     evals = bundle.get("lgbm_evals_result")
     if evals:
         _render_learning_curve(evals, best_iter)
-    else:
-        st.caption("Chưa có learning curve. Train lại để cập nhật.")
+
 
 def render():
     st.header("2. Training")
