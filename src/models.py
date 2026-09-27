@@ -168,7 +168,7 @@ def train_everything(df, category_levels):
         X_train,
         y_train,
         categorical_feature=CATEGORICAL_FEATURES,
-        eval_set=[(X_val, y_val)],
+        eval_set=[(X_train, y_train), (X_val, y_val)],
         eval_metric="binary_logloss",
         callbacks=[lgb.early_stopping(40, verbose=False)],
     )
@@ -236,6 +236,10 @@ def train_everything(df, category_levels):
         },
         "scale_pos_weight": float(scale_pos_weight),
         "lgbm_best_iteration": int(lgbm.best_iteration_ or lgbm.n_estimators),
+        "lgbm_evals_result": {
+            "train": lgbm.evals_result_["training"],
+            "validation": lgbm.evals_result_["valid_1"],
+        },
         "lgbm_feature_importance": importance,
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
     }

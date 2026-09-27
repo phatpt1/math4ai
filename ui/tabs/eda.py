@@ -3,9 +3,27 @@ import streamlit as st
 
 from src.config import TARGET
 from src.data import normalize_dataset
+import pandas as pd
+
+def _render_dataset_source():
+    with st.expander("📂 Dataset", expanded=st.session_state["dataset"] is None):
+        uploaded = st.file_uploader("Upload online_shoppers.csv", type=["csv"])
+
+        if uploaded is not None and st.session_state.get("uploaded_file_id") != uploaded.file_id:
+            try:
+                st.session_state["dataset"] = pd.read_csv(uploaded)
+                st.session_state["dataset_name"] = uploaded.name
+                st.session_state["uploaded_file_id"] = uploaded.file_id
+            except Exception as e:
+                st.error(f"Không đọc được CSV: {e}")
+
+        name = st.session_state.get("dataset_name")
+        if name:
+            st.caption(f"Đang dùng: `{name}`")
 
 def render():
     st.header("1. Bài toán và dữ liệu")
+    _render_dataset_source()
 
     st.markdown(
         r"""
@@ -27,7 +45,7 @@ $$
     df = st.session_state["dataset"]
 
     if df is None:
-        st.info("Upload dataset ở sidebar.")
+        st.info("Upload dataset ở mục Dataset phía trên.")
         return
 
     try:
