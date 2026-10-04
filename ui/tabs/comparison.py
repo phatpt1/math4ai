@@ -1,148 +1,145 @@
-import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
-from sklearn.metrics import precision_recall_curve
-
-METRIC_COLS = ["ap", "recall", "f1", "precision", "roc_auc", "accuracy", "threshold"]
-
-
-def _to_table(metrics_dict):
-    df = (
-        pd.DataFrame(metrics_dict).T
-        .reset_index()
-        .rename(columns={"index": "Model"})
-    )
-    table = df[["Model"] + METRIC_COLS].copy()
-    for col in METRIC_COLS:
-        table[col] = table[col].astype(float).round(4)
-    return table.sort_values(["ap", "f1", "recall"], ascending=False)
-
-
-def _render_selection_logic():
-    st.markdown(
-        """
-**Train 4 model → Validation chọn model + threshold → khóa lựa chọn → Test báo cáo cuối.**
-
-Tiêu chí chọn: **AP trên Validation** (hòa thì xét F1, rồi Recall). Test **không** được dùng để chọn.
-"""
-    )
-
-
-def _render_tables(bundle):
-    winner = bundle["recommended_model"]
-
-    st.subheader("A. Validation — dùng để CHỌN model")
-    st.dataframe(_to_table(bundle["validation_metrics"]), width="stretch", hide_index=True)
-    st.success(f"🏆 Model được chọn: **{winner}** — dựa trên Validation AP, không nhìn trước Test.")
-
-    st.subheader("B. Test — chỉ báo cáo cuối")
-    st.dataframe(_to_table(bundle["metrics"]), width="stretch", hide_index=True)
-
-
-def _render_confusion_matrix(bundle):
-    winner = bundle["recommended_model"]
-    m = bundle["metrics"][winner]
-    tn, fp, fn, tp = m["tn"], m["fp"], m["fn"], m["tp"]
-
-    st.subheader(f"C. Confusion Matrix — {winner} trên Test")
-
-    fig = px.imshow(
-        np.array([[tn, fp], [fn, tp]]),
-        x=["Pred: Not purchased", "Pred: Purchased"],
-        y=["Actual: Not purchased", "Actual: Purchased"],
-        text_auto=True,
-        color_continuous_scale="Blues",
-        aspect="auto",
-        title=f"threshold = {m['threshold']:.3f}",
-    )
-    fig.update_layout(coloraxis_showscale=False)
-    st.plotly_chart(fig, width="stretch")
-
-    st.markdown(
-        f"""
-- Trong **{tp + fn}** khách thực sự mua: bắt được **{tp}**, bỏ sót **{fn}** → Recall = **{tp / max(tp + fn, 1):.1%}**
-- Trong **{tp + fp}** phiên model báo mua: đúng **{tp}**, báo nhầm **{fp}** → Precision = **{tp / max(tp + fp, 1):.1%}**
-"""
-    )
-
-
-def _render_pr_curve(bundle):
-    preds = bundle.get("predictions")
-    if not preds:
-        return
-
-    st.subheader("D. Precision–Recall curve trên Test")
-
-    winner = bundle["recommended_model"]
-    y_true = preds["y_test"]
-    fig = go.Figure()
-
-    for name, prob in preds["test_prob"].items():
-        precision, recall, _ = precision_recall_curve(y_true, prob)
-        fig.add_trace(
-            go.Scatter(
-                x=recall,
-                y=precision,
-                mode="lines",
-                name=f"{name} (AP = {bundle['metrics'][name]['ap']:.3f})",
-                line=dict(width=3 if name == winner else 1.5),
-            )
-        )
-
-    m = bundle["metrics"][winner]
-    fig.add_trace(
-        go.Scatter(
-            x=[m["recall"]],
-            y=[m["precision"]],
-            mode="markers",
-            marker=dict(size=12, symbol="star"),
-            name=f"{winner} @ threshold {m['threshold']:.3f}",
-        )
-    )
-
-    base_rate = float(np.mean(y_true))
-    fig.add_hline(y=base_rate, line_dash="dash", annotation_text=f"random = {base_rate:.3f}")
-    fig.update_layout(
-        xaxis_title="Recall",
-        yaxis_title="Precision",
-        xaxis_range=[0, 1],
-        yaxis_range=[0, 1.02],
-    )
-    st.plotly_chart(fig, width="stretch")
-    st.caption("AP = diện tích dưới đường PR. Ngôi sao = điểm làm việc thực tế của model được chọn.")
-
-
-def _render_feature_importance(bundle):
-    st.subheader("E. Feature Importance (LightGBM, Gain)")
-
-    imp = bundle["lgbm_feature_importance"]
-    plot_df = imp.nlargest(10, "gain_pct").sort_values("gain_pct")
-
-    fig = px.bar(
-        plot_df,
-        x="gain_pct",
-        y="feature",
-        orientation="h",
-        text="gain_pct",
-        labels={"gain_pct": "Gain (%)", "feature": ""},
-    )
-    fig.update_traces(texttemplate="%{text:.1f}%")
-    st.plotly_chart(fig, width="stretch")
-    st.caption("Gain = tổng mức giảm loss mà feature mang lại. Chỉ cho biết mức độ quan trọng, không cho biết chiều tác động.")
 
 
 def render():
     st.header("3. Model Comparison")
 
     bundle = st.session_state["bundle"]
+
     if bundle is None:
-        st.info("Train 4 model ở tab 2️⃣ trước.")
+        st.info("Train 4 model trước để có dữ liệu so sánh.")
         return
 
-    _render_selection_logic()
-    _render_tables(bundle)
-    _render_confusion_matrix(bundle)
-    _render_pr_curve(bundle)
-    _render_feature_importance(bundle)
+    st.markdown(
+        """
+### Logic chọn model
+
+Không phải **train xong rồi nhìn Test để chọn**. Flow đúng là:
+
+**Train 4 model → Validation chọn model + threshold → khóa lựa chọn → Test báo cáo cuối.**
+
+Vì `Revenue=True` là lớp thiểu số, tiêu chí chính là **AP trên Validation**.
+Nếu AP bằng nhau, dùng **F1**, sau đó **Recall** để phá hòa.
+        """
+    )
+
+    if "validation_metrics" not in bundle:
+        st.warning(
+            "Bundle đang load là phiên bản cũ, chưa lưu Validation metrics. "
+            "Hãy Re-train một lần bằng code FINAL để việc chọn model không dùng Test."
+        )
+
+    val_metrics_dict = bundle.get("validation_metrics", bundle["metrics"])
+    test_metrics_dict = bundle["metrics"]
+
+    val_metrics = (
+        pd.DataFrame(val_metrics_dict).T
+        .reset_index()
+        .rename(columns={"index": "Model"})
+    )
+    test_metrics = (
+        pd.DataFrame(test_metrics_dict).T
+        .reset_index()
+        .rename(columns={"index": "Model"})
+    )
+
+    cols = [
+        "Model", "ap", "recall", "f1",
+        "precision", "roc_auc", "accuracy", "threshold"
+    ]
+
+    st.subheader("A. Validation — dùng để CHỌN model")
+    val_table = val_metrics[cols].copy()
+    for col in cols[1:]:
+        val_table[col] = val_table[col].astype(float).round(4)
+    st.dataframe(
+        val_table.sort_values(["ap", "f1", "recall"], ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    winner = bundle["recommended_model"]
+    st.success(
+        f"🏆 Model được chọn: **{winner}** — "
+        f"dựa trên Validation, không nhìn trước Test."
+    )
+    st.caption(bundle.get("selection_rule", "Chọn theo Validation AP."))
+
+    winner_row = val_metrics[val_metrics["Model"] == winner].iloc[0]
+    st.markdown(
+        f"**Vì sao {winner} thắng?** Validation AP = "
+        f"**{float(winner_row['ap']):.4f}**, "
+        f"F1 = **{float(winner_row['f1']):.4f}**, "
+        f"Recall = **{float(winner_row['recall']):.4f}**. "
+        "Theo rule của project, AP được xét trước."
+    )
+
+    st.subheader("B. Test — chỉ báo cáo cuối")
+    test_table = test_metrics[cols].copy()
+    for col in cols[1:]:
+        test_table[col] = test_table[col].astype(float).round(4)
+    st.dataframe(
+        test_table.sort_values("ap", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    metric_name = st.selectbox(
+        "Vẽ metric nào?",
+        ["ap", "recall", "f1", "precision", "roc_auc", "accuracy"],
+    )
+    view_split = st.radio(
+        "Dữ liệu để vẽ",
+        ["Validation", "Test"],
+        horizontal=True,
+    )
+    plot_metrics = val_metrics if view_split == "Validation" else test_metrics
+
+    fig = px.bar(
+        plot_metrics.sort_values(metric_name),
+        x=metric_name,
+        y="Model",
+        orientation="h",
+        text=metric_name,
+        title=f"{view_split}: so sánh {metric_name.upper()}",
+    )
+    fig.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.info(
+        "Cách đọc: AP = tiêu chí chọn chính; Recall = bắt được bao nhiêu "
+        "khách thực sự mua; F1 = cân bằng Precision và Recall. Accuracy chỉ "
+        "là chỉ số bổ sung vì target mất cân bằng."
+    )
+
+    st.subheader("LightGBM Feature Importance — chẩn đoán riêng LightGBM")
+    st.caption(
+        "Phần này giúp hiểu LightGBM, KHÔNG phải quy tắc chọn model. "
+        "Model thắng cuộc vẫn do Validation metrics quyết định."
+    )
+
+    imp_mode = st.radio("Importance", ["Gain", "Split"], horizontal=True)
+    imp = bundle["lgbm_feature_importance"].copy()
+
+    if imp_mode == "Gain":
+        plot_df = imp.nlargest(12, "gain_pct").sort_values("gain_pct")
+        fig = px.bar(
+            plot_df, x="gain_pct", y="feature", orientation="h",
+            text="gain_pct", title="LightGBM Gain importance"
+        )
+        fig.update_traces(texttemplate="%{text:.1f}%")
+        st.caption(
+            "Gain = tổng mức cải thiện objective khi feature được dùng. "
+            "Gain không cho biết hướng tác động."
+        )
+    else:
+        plot_df = imp.nlargest(12, "split").sort_values("split")
+        fig = px.bar(
+            plot_df, x="split", y="feature", orientation="h",
+            text="split", title="LightGBM Split importance"
+        )
+        st.caption("Split = số lần feature được dùng để chia node.")
+
+    st.plotly_chart(fig, use_container_width=True)

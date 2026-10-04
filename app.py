@@ -6,8 +6,14 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import streamlit as st
 
-from ui.state import init_session_state
-from ui.tabs import comparison, eda, explain, prediction, training
+from ui.sidebar import init_session_state, render_sidebar
+from ui.tabs import (
+    comparison,
+    eda,
+    explain,
+    prediction,
+    training,
+)
 
 st.set_page_config(
     page_title="Online Shopper ML Lab",
@@ -19,12 +25,19 @@ init_session_state()
 
 st.title("🛒 Online Shopper Purchase Prediction — ML Lab")
 
-bundle = st.session_state["bundle"]
-if bundle is not None:
-    trained_at = bundle.get("trained_at_utc", "")[:19].replace("T", " ")
-    st.caption(f"✅ Model sẵn sàng · trained at {trained_at} UTC")
-else:
-    st.warning("⚠️ Chưa có model. Vào tab **2️⃣ Training** để train.")
+st.caption(
+    "Một app.py duy nhất: "
+    "Load model đã lưu → Predict ngay; "
+    "chỉ Re-train khi muốn cập nhật model."
+)
+
+if st.session_state.get("bundle") is not None:
+    st.success(
+        "✅ Model đã được load tự động từ repo/GitHub. "
+        "Bạn có thể Predict ngay mà không cần train lại."
+    )
+
+render_sidebar()
 
 tabs = st.tabs(
     [

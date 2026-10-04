@@ -2,77 +2,118 @@ import numpy as np
 import plotly.express as px
 import streamlit as st
 
-from src.inference import get_what_if_sensitivity
-
-PUSH_UP = "Đẩy score lên"
-PULL_DOWN = "Kéo score xuống"
-
-
-def _fmt(value):
-    if isinstance(value, (float, np.floating)):
-        return f"{round(float(value), 4):g}"
-    return str(value)
+from src.inference import get_lgbm_contributions, get_what_if_sensitivity, sigmoid
 
 
 def render():
     st.header("5. Explain Prediction")
 
     bundle = st.session_state["bundle"]
+
     if bundle is None:
-        st.info("Train model ở tab 2️⃣ trước.")
+        st.info("Train/load model trước.")
         return
 
     if "last_input" not in st.session_state:
-        st.info("Hãy chọn một kịch bản và bấm Predict ở tab 4️⃣ trước.")
+        st.info("Hãy sang Live Prediction và Predict một sample trước.")
         return
 
     model_name = st.session_state.get("last_model_name", bundle["recommended_model"])
     input_df = st.session_state["last_input"]
 
-    score, threshold, pred, sensitivity = get_what_if_sensitivity(model_name, input_df, bundle)
-
-    st.caption(
-        f"Đang giải thích: **{model_name}** · score **{score * 100:.1f}%** · "
-        f"threshold {threshold * 100:.1f}% · **{'MUA' if pred else 'KHÔNG MUA'}**"
-    )
-
     st.markdown(
-        "Với từng feature: **giữ nguyên mọi thứ khác, chỉ đưa feature đó về mức của khách điển hình** "
-        "(median/mode của TRAIN) → score thay đổi bao nhiêu điểm %?"
+        f"""
+### Đang giải thích prediction của **{model_name}**
+
+Có 2 mức giải thích:
+
+1. **What-if sensitivity** — dùng được cho cả 4 model: thay từng feature về baseline của TRAIN và xem score đổi bao nhiêu.
+2. **Native LightGBM contribution** — chỉ khi model là LightGBM: phân rã raw score thành base value + đóng góp feature.
+        """
     )
 
-    top = sensitivity[sensitivity["abs_delta"] > 1e-4].head(10).copy()
-    if top.empty:
-        st.info("Khách này đang trùng với khách điển hình nên không có feature nào tạo khác biệt.")
+    score, threshold, pred, sensitivity = get_what_if_sensitivity(
+        model_name, input_df, bundle
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Model score", f"{score*100:.2f}%")
+    c2.metric("Threshold", f"{threshold:.3f}")
+    c3.metric("Prediction", "MUA" if pred else "KHÔNG MUA")
+
+    st.subheader("A. What-if sensitivity — dễ hiểu, dùng cho mọi model")
+    st.markdown(
+        """
+Với từng feature, app hỏi: **nếu giữ mọi thứ như cũ nhưng thay riêng feature này bằng giá trị baseline của TRAIN thì score thay đổi bao nhiêu?**
+
+- `score_delta > 0`: giá trị hiện tại đang đẩy score Mua **cao hơn baseline**.
+- `score_delta < 0`: giá trị hiện tại đang kéo score Mua **thấp hơn baseline**.
+- Các delta này **không cộng lại chính xác thành score**; đây là phân tích what-if, không phải SHAP.
+        """
+    )
+    top = sensitivity.head(10).copy().sort_values("score_delta")
+    top["direction"] = np.where(
+        top["score_delta"] >= 0,
+        "Đẩy score cao hơn baseline",
+        "Kéo score thấp hơn baseline",
+    )
+    fig = px.bar(
+        top, x="score_delta", y="feature", orientation="h",
+        color="direction", title=f"What-if sensitivity — {model_name}"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(
+        sensitivity.head(10)[
+            ["feature", "current_value", "baseline_value", "score_delta"]
+        ],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if model_name != "LightGBM":
+        st.info(
+            "Native additive contribution trong app hiện chỉ có cho LightGBM. "
+            "Với model này, phần A vẫn giải thích prediction bằng phân tích what-if nhất quán."
+        )
         return
 
-    top["delta_pct"] = top["score_delta"] * 100
-    top["direction"] = np.where(top["delta_pct"] >= 0, PUSH_UP, PULL_DOWN)
-    top = top.sort_values("delta_pct")
+    st.subheader("B. Native LightGBM contribution — phân rã raw score")
+    base, raw_score, contrib = get_lgbm_contributions(input_df, bundle)
+    probability_like_score = sigmoid(raw_score)
+    st.markdown(
+        r"""
+LightGBM có thể trả contribution trực tiếp:
 
-    fig = px.bar(
-        top,
-        x="delta_pct",
-        y="feature",
-        orientation="h",
-        color="direction",
-        color_discrete_map={PUSH_UP: "#198754", PULL_DOWN: "#dc3545"},
-        text=top["delta_pct"].map(lambda v: f"{v:+.1f}"),
-        labels={"delta_pct": "Thay đổi score (điểm %)", "feature": "", "direction": ""},
-        title=f"What-if sensitivity — {model_name}",
+\[
+F(x)=BaseValue+\sum_j \phi_j
+\]
+
+Sau đó:
+
+\[
+score=\sigma(F(x))=\frac{1}{1+e^{-F(x)}}
+\]
+
+- \(\phi_j>0\): đẩy raw score về phía Mua.
+- \(\phi_j<0\): đẩy raw score về phía Không mua.
+            """
     )
-    fig.update_traces(textposition="outside")
-    st.plotly_chart(fig, width="stretch")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Base raw score", f"{base:.4f}")
+    d2.metric("Final raw score", f"{raw_score:.4f}")
+    d3.metric("Sigmoid(raw)", f"{probability_like_score*100:.2f}%")
 
+    topc = contrib.head(10).copy().sort_values("contribution")
+    topc["direction"] = np.where(
+        topc["contribution"] >= 0,
+        "Đẩy về Mua",
+        "Đẩy về Không mua",
+    )
+    fig2 = px.bar(
+        topc, x="contribution", y="feature", orientation="h",
+        color="direction", title="Native LightGBM local contribution"
+    )
+    st.plotly_chart(fig2, use_container_width=True)
     st.caption(
-        "Các delta không cộng lại chính xác thành score, vì các feature tương tác với nhau "
-        "(phân tích độ nhạy, không phải SHAP)."
+        "Đây là contribution lấy trực tiếp từ LightGBM, "
+        "không phải rule if/else tự viết."
     )
-
-    with st.expander("Bảng chi tiết"):
-        table = sensitivity.head(10)[["feature", "current_value", "baseline_value", "score_delta"]].copy()
-        table["current_value"] = table["current_value"].map(_fmt)
-        table["baseline_value"] = table["baseline_value"].map(_fmt)
-        table["score_delta"] = (table["score_delta"] * 100).round(2)
-        table = table.rename(columns={"score_delta": "score_delta (điểm %)"})
-        st.dataframe(table, width="stretch", hide_index=True)
