@@ -74,12 +74,6 @@ def train_everything(df, category_levels):
     models = {}
     validation_results = {}
     test_results = {}
-    predictions = {
-        "y_val": y_val.to_numpy(),
-        "y_test": y_test.to_numpy(),
-        "val_prob": {},
-        "test_prob": {},
-    }
 
     tree = Pipeline(
         [
@@ -147,8 +141,6 @@ def train_everything(df, category_levels):
         test_prob = model.predict_proba(X_test)[:, 1]
         test_results[name] = evaluate_model(y_test, test_prob, threshold)
         models[name] = model
-        predictions["val_prob"][name] = val_prob
-        predictions["test_prob"][name] = test_prob
 
     negative = int((y_train == 0).sum())
     positive = int((y_train == 1).sum())
@@ -176,7 +168,7 @@ def train_everything(df, category_levels):
         X_train,
         y_train,
         categorical_feature=CATEGORICAL_FEATURES,
-        eval_set=[(X_train, y_train), (X_val, y_val)],
+        eval_set=[(X_val, y_val)],
         eval_metric="binary_logloss",
         callbacks=[lgb.early_stopping(40, verbose=False)],
     )
@@ -188,8 +180,6 @@ def train_everything(df, category_levels):
     test_prob = lgbm.predict_proba(X_test)[:, 1]
     test_results["LightGBM"] = evaluate_model(y_test, test_prob, threshold)
     models["LightGBM"] = lgbm
-    predictions["val_prob"]["LightGBM"] = val_prob
-    predictions["test_prob"]["LightGBM"] = test_prob
 
     # Diagnostic only, not used for model selection
     gain = lgbm.booster_.feature_importance(importance_type="gain")
@@ -246,13 +236,8 @@ def train_everything(df, category_levels):
         },
         "scale_pos_weight": float(scale_pos_weight),
         "lgbm_best_iteration": int(lgbm.best_iteration_ or lgbm.n_estimators),
-        "lgbm_evals_result": {
-            "train": lgbm.evals_result_["training"],
-            "validation": lgbm.evals_result_["valid_1"],
-        },
         "lgbm_feature_importance": importance,
         "trained_at_utc": datetime.now(timezone.utc).isoformat(),
-        "predictions": predictions,
     }
 
     return bundle
