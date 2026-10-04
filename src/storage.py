@@ -1,9 +1,11 @@
 import json
 from datetime import datetime, timezone
 from io import BytesIO
+from pathlib import Path
 
 import joblib
-
+MODEL_DIR = Path("models")
+BUNDLE_PATH = MODEL_DIR / "purchase_model_bundle.joblib"
 
 def serialize_bundle(bundle) -> bytes:
     buffer = BytesIO()
@@ -24,3 +26,19 @@ def make_metrics_json(bundle) -> str:
     }
 
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+def save_bundle_local(bundle, path=BUNDLE_PATH):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(bundle, path)
+    return path
+
+
+def load_bundle_local(path=BUNDLE_PATH):
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        return joblib.load(path)
+    except Exception:
+        return None
